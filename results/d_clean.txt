@@ -1,0 +1,15 @@
+{
+  "run": "demo",
+  "models": 18,
+  "items_per_model_mean": 9.38888888888889,
+  "answers_used": 169,
+  "paid_calls": 169,
+  "full_eval_calls": 7200,
+  "call_reduction_vs_full": 0.9765277777777778,
+  "cache_hit_rate": 0.0,
+  "cost_usd": 0.3294,
+  "kendall_tau_vs_full_theta": 0.8000042999540444,
+  "kendall_tau_vs_full_accuracy": 0.7606598261858126,
+  "wall_clock_s": 6.933477163314819,
+  "kendall_tau_vs_true_theta": 0.7868894753646338
+}

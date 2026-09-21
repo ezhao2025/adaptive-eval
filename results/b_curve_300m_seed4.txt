@@ -1,0 +1,55 @@
+[
+  {
+    "items": 5,
+    "tau_max_info": 0.7485854698507625,
+    "tau_random": 0.3882646691635456
+  },
+  {
+    "items": 10,
+    "tau_max_info": 0.6862354091582764,
+    "tau_random": 0.566541822721598
+  },
+  {
+    "items": 15,
+    "tau_max_info": 0.7388264669163546,
+    "tau_random": 0.6254681647940075
+  },
+  {
+    "items": 20,
+    "tau_max_info": 0.7253433208489388,
+    "tau_random": 0.6469413233458177
+  },
+  {
+    "items": 30,
+    "tau_max_info": 0.8192259675405742,
+    "tau_random": 0.7343320848938826
+  },
+  {
+    "items": 40,
+    "tau_max_info": 0.8302122347066166,
+    "tau_random": 0.7468164794007491
+  },
+  {
+    "items": 60,
+    "tau_max_info": 0.8991260923845192,
+    "tau_random": 0.8182272159800249
+  },
+  {
+    "items": 80,
+    "tau_max_info": 0.9210986267166041,
+    "tau_random": 0.8496878901373284
+  },
+  {
+    "items": 120,
+    "tau_max_info": 0.9385767790262172,
+    "tau_random": 0.8751560549313359
+  },
+  {
+    "items": 160,
+    "tau_max_info": 0.9590511860174781,
+    "tau_random": 0.9036204744069912
+  }
+]
+tau>=0.8: adaptive needs 30 items, random needs 60
+tau>=0.85: adaptive needs 60 items, random needs 120
+tau>=0.9: adaptive needs 80 items, random needs 160
