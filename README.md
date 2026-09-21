@@ -101,6 +101,9 @@ from its log, and θ is always recomputed from the log rather than stored. A run
 six steps and then resumed produces final results identical to an uninterrupted run (all
 metrics match; only wall-clock time differs). This is also covered by an automated test.
 
+The guarantee is at-least-once, not exactly-once: if the process dies after a provider
+returns but before the response is cached, that call is paid for again on resume.
+
 Synthetic-data runs (call reduction, cache reuse when tightening the stopping rule, crash demo)
 are in `results/`.
 
