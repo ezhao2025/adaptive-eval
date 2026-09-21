@@ -99,7 +99,7 @@ Everything runs in one asyncio process with SQLite storage.
 it, with `UNIQUE(session_id, step, type)` as the idempotency key. On resume, a session is rebuilt
 from its log, and θ is always recomputed from the log rather than stored. A run crashed after
 six steps and then resumed produces final results identical to an uninterrupted run (all
-metrics match; only wall-clock time differs). This is also covered by an automated test.
+metrics match; only wall-clock time differs). This is also covered by an automated test, and was checked with a real `kill -9` mid-run.
 
 The guarantee is at-least-once, not exactly-once: if the process dies after a provider
 returns but before the response is cached, that call is paid for again on resume.
