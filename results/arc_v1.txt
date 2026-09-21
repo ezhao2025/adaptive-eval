@@ -1,0 +1,14 @@
+{
+  "run": "arc-v1",
+  "models": 94,
+  "items_per_model_mean": 35.202127659574465,
+  "answers_used": 3309,
+  "paid_calls": 3309,
+  "full_eval_calls": 110168,
+  "call_reduction_vs_full": 0.969964054897974,
+  "cache_hit_rate": 0.0,
+  "cost_usd": 7.1842,
+  "kendall_tau_vs_full_theta": 0.13606979010663914,
+  "kendall_tau_vs_full_accuracy": 0.1681676243794328,
+  "wall_clock_s": 106.04892897605896
+}

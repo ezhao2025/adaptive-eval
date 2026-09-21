@@ -29,7 +29,7 @@ def cmd_fit(a):
     else:
         train, test = D.split_models(d["models"], a.train_frac, a.seed)
     rows = [d["models"].index(m) for m in train]
-    bank, _ = fit_2pl(d["R"][rows], d["items"])
+    bank, _ = fit_2pl(d["R"][rows], d["items"], sigma_log_a=a.sigma_log_a)
     bank.save(a.out, {"train_models": train, "test_models": test})
     msg = f"fit on {len(train)} models, {len(test)} held out -> {a.out}"
     if "truth" in d:
@@ -96,6 +96,7 @@ def main():
     f = sub.add_parser("fit"); f.set_defaults(fn=cmd_fit)
     f.add_argument("--data", default="data/synthetic.json"); f.add_argument("--out", default="data/irt_params.json")
     f.add_argument("--train-frac", type=float, default=0.7); f.add_argument("--seed", type=int, default=0)
+    f.add_argument("--sigma-log-a", type=float, default=0.5)
 
     common = dict(data="data/synthetic.json", params="data/irt_params.json", db="data/eval.db")
     r = sub.add_parser("run"); r.set_defaults(fn=cmd_run, **common)
