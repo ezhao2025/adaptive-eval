@@ -46,8 +46,13 @@ def build_context(d, bank, db_path, seed=0):
                  if not np.isnan(d["R"][midx[m], j])}
     providers = {n: ReplayProvider(n, c, responses, seed) for n, c in DEFAULT_PROVIDERS.items()}
     limiters = {n: ProviderLimiter(c.rpm, c.tpm) for n, c in DEFAULT_PROVIDERS.items()}
+    bidx = bank.index()
+    available: dict[str, set[int]] = {}
+    for m, it in responses:
+        if it in bidx:
+            available.setdefault(m, set()).add(bidx[it])
     ctx = Context(bank, providers, DEFAULT_PROVIDERS, limiters, ResponseCache(conn),
-                  EventStore(conn), d["model_provider"])
+                  EventStore(conn), d["model_provider"], available=available)
     return ctx, conn
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
@@ -44,9 +45,11 @@ class Context:
     store: EventStore
     model_provider: dict[str, str]
     retries: int = 0
+    available: dict[str, set[int]] | None = None   # per-model answerable items; None = all
 
 
-async def call_item(ctx: Context, model: str, item_id: str, cfg: SessionConfig) -> tuple[dict, bool]:
+async def call_item(ctx: Context, model: str, item_id: str, cfg: SessionConfig,
+                    *, session_id: str = "", step: int = -1) -> tuple[dict, bool]:
     """Cache first; on miss, rate-limit, call, retry transient errors with backoff + jitter."""
     pname = ctx.model_provider[model]
     key = ResponseCache.make_key(model=model, item=item_id, prompt=cfg.prompt_version,
@@ -57,14 +60,26 @@ async def call_item(ctx: Context, model: str, item_id: str, cfg: SessionConfig) 
     provider, pcfg = ctx.providers[pname], ctx.provider_cfgs[pname]
     for attempt in range(cfg.max_retries + 1):
         await ctx.limiters[pname].acquire(pcfg.est_tokens_per_call)
+        t0 = time.time()
+
+        def log(outcome):
+            ctx.store.log_attempt(session_id, step, attempt, pname, model, item_id,
+                                  outcome, t0, time.time() - t0)
+
         try:
             resp = await provider.answer(model, item_id)
-            break
         except TransientError:
+            log("transient_error")
             if attempt == cfg.max_retries:
                 raise
             ctx.retries += 1
             await asyncio.sleep(min(8.0, 0.1 * 2 ** attempt) * random.uniform(0.5, 1.5))
+            continue
+        except Exception:
+            log("error")
+            raise
+        log("ok")
+        break
     value = asdict(resp)
     ctx.cache.put(key, value)
     return value, False
@@ -86,17 +101,20 @@ async def run_session(ctx: Context, run_name: str, model: str, cfg: SessionConfi
     while not st.done:
         if st.pending is None:
             n = len(st.answered)
-            if n >= min(cfg.max_items, len(ctx.bank)) or (n >= cfg.min_items and se < cfg.se_target):
+            allowed = None if ctx.available is None else ctx.available.get(model, set())
+            pool = len(ctx.bank) if allowed is None else len(allowed)
+            if n >= min(cfg.max_items, pool) or (n >= cfg.min_items and se < cfg.se_target):
                 break
             used = {idx[i] for i, _ in st.answered}
-            item_id = ctx.bank.item_ids[select_next(cfg.selector, theta, ctx.bank, used, session_id, n)]
+            item_id = ctx.bank.item_ids[select_next(cfg.selector, theta, ctx.bank, used,
+                                                    session_id, n, allowed)]
             ctx.store.append(session_id, n, "item_selected", item_id)   # write-ahead
             st.pending = (n, item_id)
 
         step, item_id = st.pending
         if crash_after_step is not None and step >= crash_after_step:
             raise SimulatedCrash(f"{session_id} crashed at step {step}")
-        value, cached = await call_item(ctx, model, item_id, cfg)
+        value, cached = await call_item(ctx, model, item_id, cfg, session_id=session_id, step=step)
         ctx.store.append(session_id, step, "answer_recorded", item_id,
                          correct=int(value["correct"]), cached=int(cached),
                          cost=0.0 if cached else value["cost_usd"])

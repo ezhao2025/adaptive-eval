@@ -99,9 +99,16 @@ def fisher_information(theta: float, a: np.ndarray, b: np.ndarray) -> np.ndarray
 
 
 def select_next(selector: str, theta: float, bank: ItemBank, used: set[int],
-                session_id: str, step: int) -> int:
-    """Deterministic given (session, step, answers so far) -- required for crash replay."""
-    available = np.array([i for i in range(len(bank)) if i not in used])
+                session_id: str, step: int, allowed: set[int] | None = None) -> int:
+    """Deterministic given (session, step, answers so far) -- required for crash replay.
+
+    allowed: item indices this model may be asked (in replay, items with a logged answer).
+    None means every item. Raises ValueError when nothing selectable is left.
+    """
+    available = np.array([i for i in range(len(bank))
+                          if i not in used and (allowed is None or i in allowed)], dtype=int)
+    if available.size == 0:
+        raise ValueError("no selectable items left")
     if selector == "max_info":
         info = fisher_information(theta, bank.a[available], bank.b[available])
         return int(available[np.argmax(info)])  # argmax breaks ties by lowest index

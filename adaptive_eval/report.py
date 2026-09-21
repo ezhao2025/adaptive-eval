@@ -70,9 +70,11 @@ def offline_curve(d: dict, bank: ItemBank, models: list[str], budgets: list[int]
         for sel in ("max_info", "random"):
             thetas = []
             for m in models:
+                allowed = {i for i, it in enumerate(bank.item_ids)
+                           if not np.isnan(d["R"][midx[m], didx[it]])}
                 order, ys, th = [], [], 0.0
-                for step in range(min(k, len(bank))):
-                    i = select_next(sel, th, bank, set(order), f"curve:{m}", step)
+                for step in range(min(k, len(allowed))):
+                    i = select_next(sel, th, bank, set(order), f"curve:{m}", step, allowed)
                     order.append(i)
                     ys.append(d["R"][midx[m], didx[bank.item_ids[i]]])
                     ii = np.array(order)

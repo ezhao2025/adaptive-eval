@@ -59,6 +59,8 @@ class ReplayProvider:
         await asyncio.sleep(self.rng.uniform(*self.cfg.latency))
         if self.rng.random() < self.cfg.failure_rate:
             raise TransientError(f"{self.name}: simulated 503")
+        if (model, item_id) not in self.responses:   # a bug upstream, so not retryable
+            raise LookupError(f"no logged answer for {model} on {item_id}")
         correct = self.responses[(model, item_id)]
         tin, tout = 850, 20      # rough image+prompt / short answer
         cost = tin / 1000 * self.cfg.usd_per_1k_input + tout / 1000 * self.cfg.usd_per_1k_output

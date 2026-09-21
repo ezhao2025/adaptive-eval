@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS events (
     session_id TEXT NOT NULL, step INTEGER NOT NULL, type TEXT NOT NULL,
     item_id TEXT NOT NULL, correct INTEGER, cached INTEGER, cost_usd REAL, ts REAL,
     UNIQUE(session_id, step, type));          -- idempotency key
+CREATE TABLE IF NOT EXISTS call_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT, step INTEGER, attempt INTEGER, provider TEXT, model TEXT,
+    item_id TEXT, outcome TEXT NOT NULL, started_at REAL NOT NULL, latency_s REAL);
 """
 
 
@@ -104,6 +108,15 @@ class EventStore:
             else:
                 st.pending = (step, selected[step])
         return st
+
+    def log_attempt(self, session_id, step, attempt, provider, model, item_id,
+                    outcome, started_at, latency_s) -> None:
+        """One row per provider call, failures included. Deliberately not idempotent:
+        every attempt consumed rate limit (and maybe money), even if it gets repeated."""
+        self.conn.execute(
+            "INSERT INTO call_attempts (session_id, step, attempt, provider, model, item_id,"
+            " outcome, started_at, latency_s) VALUES (?,?,?,?,?,?,?,?,?)",
+            (session_id, step, attempt, provider, model, item_id, outcome, started_at, latency_s))
 
     def finish(self, session_id, theta, se, n_items) -> None:
         self.conn.execute(

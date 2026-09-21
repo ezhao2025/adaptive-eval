@@ -6,3 +6,4 @@ __pycache__/
 data/fluid/
 data/fluid_*.json
 data/fluid_*.json
+data/*.json
