@@ -23,7 +23,11 @@ def cmd_gen(a):
 
 def cmd_fit(a):
     d = D.load(a.data)
-    train, test = D.split_models(d["models"], a.train_frac, a.seed)
+    if d.get("holdout_models"):
+        test = d["holdout_models"]
+        train = [m for m in d["models"] if m not in set(test)]
+    else:
+        train, test = D.split_models(d["models"], a.train_frac, a.seed)
     rows = [d["models"].index(m) for m in train]
     bank, _ = fit_2pl(d["R"][rows], d["items"])
     bank.save(a.out, {"train_models": train, "test_models": test})
@@ -100,12 +104,15 @@ def main():
     r.add_argument("--concurrency", type=int, default=64); r.add_argument("--models", default="test")
     r.add_argument("--crash-after", type=int, default=None)
     r.add_argument("--db", default=common["db"])
+    r.add_argument("--data", default=common["data"]); r.add_argument("--params", default=common["params"])
 
     rep = sub.add_parser("report"); rep.set_defaults(fn=cmd_report, **common)
     rep.add_argument("--run-name", required=True); rep.add_argument("--db", default=common["db"])
+    rep.add_argument("--data", default=common["data"]); rep.add_argument("--params", default=common["params"])
 
     c = sub.add_parser("curve"); c.set_defaults(fn=cmd_curve, **common)
     c.add_argument("--budgets", default="5,10,15,20,30,40,60,80,120,160")
+    c.add_argument("--data", default=common["data"]); c.add_argument("--params", default=common["params"])
 
     a = p.parse_args()
     a.fn(a)
