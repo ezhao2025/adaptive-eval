@@ -206,6 +206,38 @@ of next steps but made runs 9% slower and 4.5% more expensive by competing with 
 for rate-limit capacity. Speculation can only reuse spare capacity; it should pay off when
 calls are slow and rate limits are loose, which this benchmark does not exercise.
 
+### Scaling
+
+Throughput vs worker count (2 concurrent calls per worker, simulated calls at 4x replay
+latency, 60 sessions):
+
+| Workers | Loose limit (calls/s) | Tight limit (calls/s) |
+|---:|---:|---:|
+| 1 | 12.0 | 12.2 |
+| 2 | 23.7 | 24.1 |
+| 4 | 44.1 | 29.4 |
+| 8 | 68.2 | 35.2 |
+
+Near-linear while workers are the bottleneck (5.7x throughput at 8 workers, wall clock
+53.8 s -> 9.7 s), then a plateau once the shared rate limit binds: under the tight limit,
+going from 4 to 8 workers adds only 1.2x.
+
+### Speculation across stopping rules
+
+In a latency-bound regime (loose limits, slow calls, 20% spend cap), speculation still did
+not pay off: at se_target 0.2 the wall-clock change was within noise (+1.1% cost), and at
+0.3 and 0.4 runs got 9% and 13% slower (+5.2% and +7.8% cost) with hit rates of 19-24%.
+Speculation stays correctness-safe (identical results in all 18 runs), but its per-step
+planning overhead outweighed the savings here.
+
+### Recovery cost
+
+Extra paid calls caused by each fault, vs a clean run of 2,227 paid calls (3 runs each):
+killing one worker, the scheduler, or wiping Redis re-paid nothing; killing all workers
+re-paid 1 call in one of three runs (the at-least-once window between receiving a response
+and caching it). Calls killed mid-flight are not logged, so a real provider could bill for
+calls this count misses.
+
 ## Roadmap
 
 - **Real provider:** finish `AnthropicProvider` (retry only on 429, 5xx and connection errors),
