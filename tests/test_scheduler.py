@@ -108,6 +108,8 @@ async def run_b(d, bank, *, crash_after=None, drop_model=None, n_workers=3, admi
             "SELECT speculative, COALESCE(SUM(cost_usd), 0) AS usd FROM call_attempts"
             " WHERE status='ok' GROUP BY 1")}
         summary["_spec_cost"], summary["_real_cost"] = spec.get(True, 0.0), spec.get(False, 0.0)
+        summary["_events"] = {r["type"]: r["n"] for r in await pool.fetch(
+            "SELECT type, COUNT(*) AS n FROM events GROUP BY 1")}
         orphans = await pool.fetchval(
             "SELECT COUNT(*) FROM (SELECT session_id, step FROM events WHERE type='item_selected'"
             " EXCEPT SELECT session_id, step FROM events WHERE type='answer_recorded') x")
@@ -198,3 +200,14 @@ def test_speculative_spend_respects_hard_cap(setup):
     assert got == ref
     one_call = 0.0025                            # generous upper bound on one call's cost
     assert summary["_spec_cost"] <= f * (summary["_spec_cost"] + summary["_real_cost"]) + one_call
+
+
+
+@pytest.mark.parametrize("admission", [None, dict(mode="nearest", windows={p: 2 for p in FAST})])
+def test_every_step_logs_exactly_one_allocation(setup, admission):
+    d, bank, ref = setup
+    summary, rows, orphans, _ = asyncio.run(run_b(d, bank, admission=admission))
+    got = sorted((r["model"], round(r["theta"], 9), r["n_items"]) for r in rows)
+    ev = summary["_events"]
+    assert got == ref and orphans == 0          # new event type changes nothing
+    assert ev["allocation"] == ev["item_selected"] == ev["answer_recorded"]

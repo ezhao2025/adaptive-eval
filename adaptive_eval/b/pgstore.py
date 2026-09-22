@@ -25,8 +25,9 @@ CREATE TABLE IF NOT EXISTS events (
     id BIGSERIAL PRIMARY KEY,
     session_id TEXT NOT NULL, step INTEGER NOT NULL, type TEXT NOT NULL,
     item_id TEXT NOT NULL, correct INTEGER, cached INTEGER, cost_usd DOUBLE PRECISION,
-    ts DOUBLE PRECISION,
+    ts DOUBLE PRECISION, detail TEXT,
     UNIQUE (session_id, step, type));
+ALTER TABLE events ADD COLUMN IF NOT EXISTS detail TEXT;   -- JSON; used by 'allocation' 
 CREATE TABLE IF NOT EXISTS call_attempts (
     id BIGSERIAL PRIMARY KEY, job_id TEXT NOT NULL, attempt INT NOT NULL,
     provider TEXT, model TEXT, item_id TEXT, speculative BOOLEAN,
@@ -95,12 +96,13 @@ class PgEventStore:
             session_id, run_name, model, provider, json.dumps(config), time.time())
 
     async def append(self, session_id, step, type_, item_id, correct=None, cached=None,
-                     cost=None) -> bool:
-        """Returns False if this (session, step, type) already exists -- safe to retry."""
+                     cost=None, detail: str | None = None) -> bool:
+        """Returns False if this (session, step, type) already exists -- safe to retry.
+        Event types: item_selected, answer_recorded, allocation (detail = JSON)."""
         status = await self.pool.execute(
-            "INSERT INTO events (session_id, step, type, item_id, correct, cached, cost_usd, ts)"
-            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING",
-            session_id, step, type_, item_id, correct, cached, cost, time.time())
+            "INSERT INTO events (session_id, step, type, item_id, correct, cached, cost_usd, ts,"
+            " detail) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING",
+            session_id, step, type_, item_id, correct, cached, cost, time.time(), detail)
         return status == "INSERT 0 1"
 
     async def append_many(self, rows: list[tuple]) -> None:
@@ -122,7 +124,7 @@ class PgEventStore:
                 " ORDER BY step", session_id):
             if r["type"] == "item_selected":
                 selected[r["step"]] = r["item_id"]
-            else:
+            elif r["type"] == "answer_recorded":   # other event types never count as answers
                 answers[r["step"]] = r["correct"]
         for step in sorted(selected):
             if step in answers:

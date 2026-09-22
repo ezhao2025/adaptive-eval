@@ -2,6 +2,14 @@
 
 Model: P(correct | theta, a, b) = sigmoid(a * (theta - b))
   theta = model ability, a = item discrimination (>0), b = item difficulty.
+
+Stable interface (Designs B and C depend on it; keep these names and call signatures):
+  estimate_ability(a, b, y) -> (theta, se)
+  fisher_information(theta, a, b) -> per-item information
+  select_next(selector, theta, bank, used, session_id, step, allowed=None) -> item index
+  select_next must stay deterministic: B's crash recovery and speculation rely on it.
+  A multidimensional theta in Design C should change only what these return, not how
+  they are called.
 """
 from __future__ import annotations
 

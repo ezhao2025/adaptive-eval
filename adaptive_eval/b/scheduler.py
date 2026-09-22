@@ -128,9 +128,20 @@ class Scheduler:
     async def admit(self, job: Job, priority: float) -> None:
         """Hand a job to the workers, directly or through windowed priority admission."""
         if self.admission is None:
+            await self.log_allocation(job, priority)
             await self.q.enqueue(job)
         else:
+            if self.admission.on_admit is None:
+                self.admission.on_admit = self.log_allocation
             await self.admission.admit(job, priority)
+
+    async def log_allocation(self, job: Job, priority: float) -> None:
+        """Record which job got a call slot, and why. B never reads these back; Design C,
+        where sessions are coupled, needs them to explain and replay its allocations."""
+        sid, _, step = job.job_id.rpartition(":")
+        mode = "direct" if self.admission is None else self.admission.mode
+        await self.store.append(sid, int(step), "allocation", job.item_id, detail=json.dumps(
+            {"mode": mode, "priority": priority, "provider": job.provider}))
 
     async def _enqueue(self, s: Session, step: int, item_id: str) -> None:
         key = self.cache_key(s.model, item_id)

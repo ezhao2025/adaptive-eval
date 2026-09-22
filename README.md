@@ -238,6 +238,30 @@ re-paid 1 call in one of three runs (the at-least-once window between receiving 
 and caching it). Calls killed mid-flight are not logged, so a real provider could bill for
 calls this count misses.
 
+### Door to Design C
+
+Design C ranks models adaptively, which couples sessions: spending a call on one model
+changes what is worth asking the others. B is built so that C changes as little as possible.
+The admission heap becomes C's global budget allocator, and only its priority function
+changes, from one session's SE reduction to the reduction in uncertainty about the ranking.
+Every admission decision is already logged as an `allocation` event, so C's coupled
+decisions can be audited and replayed. `irt.py` keeps a stable interface: a
+multidimensional theta changes what `estimate_ability`, `fisher_information`, and
+`select_next` return, not how they are called.
+
+## Known limitations
+
+- **The scheduler is a single process.** It is recoverable (it rebuilds from the Postgres
+  event log after a crash), not highly available.
+- **Delivery is at-least-once.** A crash between a provider's response and the cache write
+  re-pays that call. Measured across 12 fault-injection runs: at most 1 re-paid call out of
+  2,227. Calls killed mid-flight are not logged, so a real provider could bill for calls
+  this count misses.
+- **Redis is a single instance with no persistence guarantees.** That is acceptable only
+  because Postgres is the source of truth: wiping Redis mid-run loses work, not results.
+- **The providers are simulated.** Latency and failure distributions will not match real
+  APIs. The next step is a retest against a real provider on a small budget.
+
 ## Roadmap
 
 - **Real provider:** finish `AnthropicProvider` (retry only on 429, 5xx and connection errors),

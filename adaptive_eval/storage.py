@@ -100,7 +100,7 @@ class EventStore:
                 (session_id,)):
             if type_ == "item_selected":
                 selected[step] = item_id
-            else:
+            elif type_ == "answer_recorded":       # other event types never count as answers
                 answers[step] = correct
         for step in sorted(selected):
             if step in answers:

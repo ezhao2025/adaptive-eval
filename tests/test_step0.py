@@ -56,3 +56,13 @@ def test_offline_curve_handles_missing(tmp_path):
     bank, _ = fit_2pl(d["R"], d["items"])
     curve = offline_curve(d, bank, d["models"], [5, 15])
     assert all(np.isfinite(r["tau_max_info"]) and np.isfinite(r["tau_random"]) for r in curve)
+
+
+
+def test_sqlite_load_state_ignores_other_event_types(tmp_path):
+    from adaptive_eval.storage import EventStore, connect
+    store = EventStore(connect(str(tmp_path / "e.db")))
+    store.append("s", 0, "item_selected", "i1")
+    store.append("s", 0, "allocation", "i1")
+    st = store.load_state("s")
+    assert st.answered == [] and st.pending == (0, "i1")

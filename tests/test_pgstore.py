@@ -143,3 +143,27 @@ def test_many_processes_can_connect_at_once():
             await drop([schema])
 
     asyncio.run(main())
+
+
+
+def test_allocation_events_never_count_as_answers():
+    """Regression: load_state used to read any non-item_selected event as an answer."""
+    schema = f"t_{uuid.uuid4().hex[:8]}"
+
+    async def main():
+        try:
+            pool = await pgstore.connect(DSN, schema)
+            store = pgstore.PgEventStore(pool)
+            await store.append("s", 0, "item_selected", "i1")
+            await store.append("s", 0, "allocation", "i1", detail='{"mode": "fifo"}')
+            pending = await store.load_state("s")
+            await store.append("s", 0, "answer_recorded", "i1", correct=1, cached=0, cost=0.1)
+            answered = await store.load_state("s")
+            await pool.close()
+        finally:
+            await drop([schema])
+        return pending, answered
+
+    pending, answered = asyncio.run(main())
+    assert pending.answered == [] and pending.pending == (0, "i1")
+    assert answered.answered == [("i1", 1)] and answered.pending is None

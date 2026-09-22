@@ -18,6 +18,8 @@ import heapq
 import itertools
 import math
 
+from collections.abc import Awaitable, Callable
+
 from .queue import Job, JobQueue
 
 
@@ -44,6 +46,8 @@ class Admission:
         self.inflight: dict[str, set[str]] = {p: set() for p in provider_cfgs}
         self.max_inflight = dict.fromkeys(provider_cfgs, 0)
         self.spent = 0.0
+        # called for every admission decision (Design C logs these as 'allocation' events)
+        self.on_admit: Callable[[Job, float], Awaitable[None]] | None = None
         self.extra_committed = 0.0               # speculative spend (set by the Speculator)
         self._seq = itertools.count()
 
@@ -60,14 +64,16 @@ class Admission:
 
     async def admit(self, job: Job, priority: float) -> None:
         key = 0.0 if self.mode == "fifo" else -priority      # max-heap on priority
-        heapq.heappush(self.heap[job.provider], (key, next(self._seq), job))
+        heapq.heappush(self.heap[job.provider], (key, next(self._seq), priority, job))
         await self._drain(job.provider)
 
     async def _drain(self, provider: str) -> None:
         h, live = self.heap[provider], self.inflight[provider]
         while h and len(live) < self.window[provider] and self._affordable(provider):
-            _, _, job = heapq.heappop(h)
+            _, _, priority, job = heapq.heappop(h)
             live.add(job.job_id)
+            if self.on_admit is not None:
+                await self.on_admit(job, priority)
             self.max_inflight[provider] = max(self.max_inflight[provider], len(live))
             await self.q.enqueue(job)
 
