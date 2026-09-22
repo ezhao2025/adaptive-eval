@@ -110,7 +110,7 @@ class EventStore:
         return st
 
     def log_attempt(self, session_id, step, attempt, provider, model, item_id,
-                    outcome, started_at, latency_s) -> None:
+                    outcome, started_at, latency_s, **_extra) -> None:
         """One row per provider call, failures included. Deliberately not idempotent:
         every attempt consumed rate limit (and maybe money), even if it gets repeated."""
         self.conn.execute(

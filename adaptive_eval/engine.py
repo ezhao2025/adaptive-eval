@@ -7,8 +7,10 @@ event loop; per-provider limiters keep every provider under its limits.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import random
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
@@ -21,6 +23,11 @@ from .storage import EventStore, ResponseCache
 
 class SimulatedCrash(Exception):
     pass
+
+
+async def _maybe(x):
+    """Await x if the storage backend is async (Postgres); pass through if sync (SQLite)."""
+    return await x if inspect.isawaitable(x) else x
 
 
 @dataclass
@@ -54,42 +61,47 @@ async def call_item(ctx: Context, model: str, item_id: str, cfg: SessionConfig,
     pname = ctx.model_provider[model]
     key = ResponseCache.make_key(model=model, item=item_id, prompt=cfg.prompt_version,
                                  decoding=cfg.decoding, sample=cfg.sample_idx)
-    hit = ctx.cache.get(key)
+    hit = await _maybe(ctx.cache.get(key))
     if hit is not None:
         return hit, True
     provider, pcfg = ctx.providers[pname], ctx.provider_cfgs[pname]
+    job_id = f"{session_id}:{step}:{uuid.uuid4().hex[:8]}"   # new id per issue of this call
     for attempt in range(cfg.max_retries + 1):
         await ctx.limiters[pname].acquire(pcfg.est_tokens_per_call)
         t0 = time.time()
 
-        def log(outcome):
-            ctx.store.log_attempt(session_id, step, attempt, pname, model, item_id,
-                                  outcome, t0, time.time() - t0)
+        async def log(outcome, resp=None):
+            await _maybe(ctx.store.log_attempt(
+                session_id, step, attempt, pname, model, item_id, outcome, t0,
+                time.time() - t0, job_id=job_id,
+                tokens=None if resp is None else resp.input_tokens + resp.output_tokens,
+                cost_usd=None if resp is None else resp.cost_usd))
 
         try:
             resp = await provider.answer(model, item_id)
         except TransientError:
-            log("transient_error")
+            await log("transient_error")
             if attempt == cfg.max_retries:
                 raise
             ctx.retries += 1
             await asyncio.sleep(min(8.0, 0.1 * 2 ** attempt) * random.uniform(0.5, 1.5))
             continue
         except Exception:
-            log("error")
+            await log("error")
             raise
-        log("ok")
+        await log("ok", resp)
         break
     value = asdict(resp)
-    ctx.cache.put(key, value)
+    await _maybe(ctx.cache.put(key, value))
     return value, False
 
 
 async def run_session(ctx: Context, run_name: str, model: str, cfg: SessionConfig,
                       crash_after_step: int | None = None) -> dict:
     session_id = f"{run_name}:{model}"
-    ctx.store.ensure_session(session_id, run_name, model, ctx.model_provider[model], asdict(cfg))
-    st = ctx.store.load_state(session_id)          # resume from log if this session crashed
+    await _maybe(ctx.store.ensure_session(session_id, run_name, model,
+                                          ctx.model_provider[model], asdict(cfg)))
+    st = await _maybe(ctx.store.load_state(session_id))          # resume from log if this session crashed
     idx = ctx.bank.index()
 
     def ability():
@@ -108,21 +120,21 @@ async def run_session(ctx: Context, run_name: str, model: str, cfg: SessionConfi
             used = {idx[i] for i, _ in st.answered}
             item_id = ctx.bank.item_ids[select_next(cfg.selector, theta, ctx.bank, used,
                                                     session_id, n, allowed)]
-            ctx.store.append(session_id, n, "item_selected", item_id)   # write-ahead
+            await _maybe(ctx.store.append(session_id, n, "item_selected", item_id))  # write-ahead
             st.pending = (n, item_id)
 
         step, item_id = st.pending
         if crash_after_step is not None and step >= crash_after_step:
             raise SimulatedCrash(f"{session_id} crashed at step {step}")
         value, cached = await call_item(ctx, model, item_id, cfg, session_id=session_id, step=step)
-        ctx.store.append(session_id, step, "answer_recorded", item_id,
-                         correct=int(value["correct"]), cached=int(cached),
-                         cost=0.0 if cached else value["cost_usd"])
+        await _maybe(ctx.store.append(session_id, step, "answer_recorded", item_id,
+                                      correct=int(value["correct"]), cached=int(cached),
+                                      cost=0.0 if cached else value["cost_usd"]))
         st.answered.append((item_id, int(value["correct"])))
         st.pending = None
         theta, se = ability()
 
-    ctx.store.finish(session_id, theta, se, len(st.answered))
+    await _maybe(ctx.store.finish(session_id, theta, se, len(st.answered)))
     return {"model": model, "theta": theta, "se": se, "n_items": len(st.answered)}
 
 
