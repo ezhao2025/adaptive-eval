@@ -42,6 +42,22 @@ return math.ceil(wait * 1000)
 """
 
 
+PEEK = """
+-- read-only: fraction of capacity currently free, min over both buckets (as a string)
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+local function level(key, rate, cap)
+  local b = redis.call('HMGET', key, 'tokens', 'ts')
+  local tokens = tonumber(b[1]) or cap
+  local ts = tonumber(b[2]) or now
+  return math.min(cap, tokens + math.max(0, now - ts) * rate)
+end
+local r = level(KEYS[1], tonumber(ARGV[1]), tonumber(ARGV[2])) / tonumber(ARGV[2])
+local k = level(KEYS[2], tonumber(ARGV[3]), tonumber(ARGV[4])) / tonumber(ARGV[4])
+return tostring(math.min(r, k))
+"""
+
+
 class RedisLimiter:
     """Drop-in for A's ProviderLimiter: `await acquire(n_tokens)` blocks until granted.
 
@@ -57,12 +73,18 @@ class RedisLimiter:
         self.req_cap = max(1.0, self.req_rate * burst_s)
         self.tok_cap = self.tok_rate * burst_s
         self.script = r.register_script(LUA)
+        self._peek = r.register_script(PEEK)
         self.waits = 0
 
     async def try_acquire(self, n_tokens: int) -> int:
         """One atomic attempt. Returns 0 if granted, else milliseconds to wait."""
         return int(await self.script(keys=self.keys, args=[
             self.req_rate, self.req_cap, self.tok_rate, self.tok_cap, n_tokens]))
+
+    async def headroom(self) -> float:
+        """Fraction of capacity free right now (0..1), without taking anything."""
+        return float(await self._peek(keys=self.keys, args=[
+            self.req_rate, self.req_cap, self.tok_rate, self.tok_cap]))
 
     async def acquire(self, n_tokens: int) -> None:
         if n_tokens > self.tok_cap:

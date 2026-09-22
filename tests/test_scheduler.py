@@ -12,6 +12,8 @@ from adaptive_eval import data as D
 from adaptive_eval.b import pgstore
 from adaptive_eval.b.admission import Admission
 from adaptive_eval.b.queue import JobQueue, connect
+from adaptive_eval.b.ratelimit_redis import limiters_for
+from adaptive_eval.b.speculate import Speculator
 from adaptive_eval.b.scheduler import Scheduler, SchedulerCrash, available_items
 from adaptive_eval.b.worker import Worker
 from adaptive_eval.cli import build_context
@@ -64,7 +66,8 @@ def responses(d, drop_model=None):
             for j, it in enumerate(d["items"]) if m != drop_model}
 
 
-async def run_b(d, bank, *, crash_after=None, drop_model=None, n_workers=3, admission=None):
+async def run_b(d, bank, *, crash_after=None, drop_model=None, n_workers=3, admission=None,
+                speculate=None):
     """admission: None, or dict of Admission kwargs (a fresh controller per scheduler)."""
     schema, prefix = f"t_{uuid.uuid4().hex[:8]}", f"t{uuid.uuid4().hex[:8]}:"
     r = connect(URL)
@@ -81,9 +84,13 @@ async def run_b(d, bank, *, crash_after=None, drop_model=None, n_workers=3, admi
         q = JobQueue(r, list(FAST), prefix)
         adm = None if admission is None else Admission(q, FAST, **admission)
         controllers.append(adm)
-        return Scheduler("eq", d["models"], d["model_provider"], bank, pool, q, CFG,
-                         available=available_items(d, bank), admission=adm,
-                         log=lambda *_: None)
+        sched = Scheduler("eq", d["models"], d["model_provider"], bank, pool, q, CFG,
+                          available=available_items(d, bank), admission=adm,
+                          log=lambda *_: None)
+        if speculate is not None:     # dict of Speculator kwargs
+            sched.speculator = Speculator(sched, limiters_for(r, FAST, prefix=prefix),
+                                          pgstore.PgResponseCache(pool), **speculate)
+        return sched
     crashed = False
     try:
         if crash_after is not None:
@@ -97,6 +104,10 @@ async def run_b(d, bank, *, crash_after=None, drop_model=None, n_workers=3, admi
         summary["_paid_cost"] = float(await pool.fetchval(
             "SELECT COALESCE(SUM(cost_usd), 0) FROM events WHERE type='answer_recorded'"))
         summary["_controllers"] = controllers
+        spec = {r["speculative"]: float(r["usd"]) for r in await pool.fetch(
+            "SELECT speculative, COALESCE(SUM(cost_usd), 0) AS usd FROM call_attempts"
+            " WHERE status='ok' GROUP BY 1")}
+        summary["_spec_cost"], summary["_real_cost"] = spec.get(True, 0.0), spec.get(False, 0.0)
         orphans = await pool.fetchval(
             "SELECT COUNT(*) FROM (SELECT session_id, step FROM events WHERE type='item_selected'"
             " EXCEPT SELECT session_id, step FROM events WHERE type='answer_recorded') x")
@@ -167,3 +178,23 @@ def test_budget_stops_the_run_without_overspending(setup, mode):
     assert "budget" in statuses and statuses <= {"done", "budget"}
     assert summary["_paid_cost"] <= budget * 1.05            # committed-cost accounting
     assert summary["budget_stopped"] > 0
+
+
+def test_speculation_changes_cost_and_speed_never_results(setup):
+    d, bank, ref = setup
+    summary, rows, orphans, _ = asyncio.run(
+        run_b(d, bank, speculate=dict(min_free=0.0, max_fraction=0.5)))
+    got = sorted((r["model"], round(r["theta"], 9), r["n_items"]) for r in rows)
+    assert got == ref and orphans == 0          # identical to Design A
+    assert summary["spec_enqueued"] > 0 and summary["spec_hits"] > 0
+    assert summary["spec_calls"] > 0
+
+
+def test_speculative_spend_respects_hard_cap(setup):
+    d, bank, ref = setup
+    f = 0.1
+    summary, rows, _, _ = asyncio.run(run_b(d, bank, speculate=dict(min_free=0.0, max_fraction=f)))
+    got = sorted((r["model"], round(r["theta"], 9), r["n_items"]) for r in rows)
+    assert got == ref
+    one_call = 0.0025                            # generous upper bound on one call's cost
+    assert summary["_spec_cost"] <= f * (summary["_spec_cost"] + summary["_real_cost"]) + one_call

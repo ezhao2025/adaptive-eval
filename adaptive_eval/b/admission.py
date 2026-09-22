@@ -44,13 +44,15 @@ class Admission:
         self.inflight: dict[str, set[str]] = {p: set() for p in provider_cfgs}
         self.max_inflight = dict.fromkeys(provider_cfgs, 0)
         self.spent = 0.0
+        self.extra_committed = 0.0               # speculative spend (set by the Speculator)
         self._seq = itertools.count()
 
     def expected_cost(self, provider: str) -> float:
         return max(self.exp_cost[provider], 1e-9)
 
     def _committed(self) -> float:
-        return self.spent + sum(len(s) * self.expected_cost(p) for p, s in self.inflight.items())
+        return self.spent + self.extra_committed + \
+            sum(len(s) * self.expected_cost(p) for p, s in self.inflight.items())
 
     def _affordable(self, provider: str) -> bool:
         return self.budget is None or \

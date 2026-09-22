@@ -29,12 +29,20 @@ import zlib
 from dataclasses import asdict
 
 import numpy as np
+from redis.exceptions import ResponseError
 
 from .. import data as D
 from ..providers import DEFAULT_PROVIDERS, ReplayProvider, TransientError
 from . import pgstore
 from .queue import Delivery, JobQueue, connect
 from .ratelimit_redis import limiters_for
+
+def redis_state_lost(e: Exception) -> bool:
+    """Redis restarted or was wiped: groups are gone (NOGROUP), or a stream vanished while
+    we were blocked reading it (UNBLOCKED ... no longer exists)."""
+    msg = str(e)
+    return "NOGROUP" in msg or "no longer exists" in msg
+
 
 # delete the inflight key only if we still own it (it may have expired and been re-claimed)
 RELEASE = ("if redis.call('GET', KEYS[1]) == ARGV[1] then "
@@ -46,7 +54,7 @@ class Worker:
                  prefix: str = "", concurrency: int = 16, max_retries: int = 6,
                  inflight_ttl_s: int = 60, min_idle_ms: int = 30_000,
                  reclaim_every_s: float = 5.0, block_ms: int = 500, poll_s: float = 0.05,
-                 burst_s: float = 1.0):
+                 burst_s: float = 1.0, spec_min_free: float = 0.3):
         self.id, self.r, self.prefix = worker_id, r, prefix
         self.providers, self.cfgs = providers, provider_cfgs
         self.q = JobQueue(r, list(provider_cfgs), prefix)
@@ -56,11 +64,12 @@ class Worker:
         self.concurrency, self.max_retries = concurrency, max_retries
         self.inflight_ttl_s, self.min_idle_ms = inflight_ttl_s, min_idle_ms
         self.reclaim_every_s, self.block_ms, self.poll_s = reclaim_every_s, block_ms, poll_s
+        self.spec_min_free = spec_min_free
         self._release = r.register_script(RELEASE)
         self.tasks: set[asyncio.Task] = set()
         self.stopping = asyncio.Event()
         self.stats = dict(jobs=0, cache_hits=0, paid=0, waited_on_inflight=0,
-                          transient=0, fatal=0, reclaimed=0)
+                          transient=0, fatal=0, reclaimed=0, spec_dropped=0)
 
     # ---- one job -------------------------------------------------------------------
     async def handle(self, d: Delivery) -> None:
@@ -88,6 +97,10 @@ class Worker:
             if value is not None:
                 self.stats["cache_hits"] += 1
                 return value, True, None
+            if job.speculative and \
+                    await self.limiters[job.provider].headroom() < self.spec_min_free:
+                self.stats["spec_dropped"] += 1      # bucket is busy: real work comes first
+                return None, False, None
             if await self.r.set(inflight, token, nx=True, ex=self.inflight_ttl_s):
                 try:
                     value = await self.cache.get(job.cache_key)   # landed just before our claim?
@@ -101,6 +114,9 @@ class Worker:
                     return value, False, error
                 finally:
                     await self._release(keys=[inflight], args=[token])
+            if job.speculative:                    # already being fetched: nothing to warm
+                self.stats["spec_dropped"] += 1
+                return None, False, None
             if not waited:                         # someone else is fetching it: don't pay twice
                 self.stats["waited_on_inflight"] += 1
                 waited = True
@@ -154,24 +170,36 @@ class Worker:
 
     async def run(self) -> None:
         await self.q.ensure_groups()
-        last_reclaim = float("-inf")               # reclaim immediately on (re)start
+        self._last_reclaim = float("-inf")         # reclaim immediately on (re)start
         while not self.stopping.is_set():
-            free = self.concurrency - len(self.tasks)
-            if free <= 0:
-                await asyncio.wait(set(self.tasks), return_when=asyncio.FIRST_COMPLETED)
-                continue
-            now = time.monotonic()
-            if now - last_reclaim >= self.reclaim_every_s:
-                last_reclaim = now
-                for d in await self.q.reclaim(self.id, self.min_idle_ms, count=free):
-                    self.stats["reclaimed"] += 1
-                    self._spawn(d)
-                continue
-            # read only as many jobs as there are free slots, so jobs don't sit idle here
-            for d in await self.q.read(self.id, count=free, block_ms=self.block_ms):
-                self._spawn(d)
+            try:
+                await self._step()
+            except ResponseError as e:
+                if not redis_state_lost(e):
+                    raise
+                # Redis lost its state (restart or FLUSHALL): recreate the groups and carry
+                # on. Postgres still has everything; the scheduler re-enqueues lost jobs.
+                print(f"[{self.id}] Redis groups missing, recreating", file=sys.stderr)
+                await self.q.ensure_groups()
+                await asyncio.sleep(0.2)
         if self.tasks:
             await asyncio.wait(set(self.tasks))
+
+    async def _step(self) -> None:
+        free = self.concurrency - len(self.tasks)
+        if free <= 0:
+            await asyncio.wait(set(self.tasks), return_when=asyncio.FIRST_COMPLETED)
+            return
+        now = time.monotonic()
+        if now - self._last_reclaim >= self.reclaim_every_s:
+            self._last_reclaim = now
+            for d in await self.q.reclaim(self.id, self.min_idle_ms, count=free):
+                self.stats["reclaimed"] += 1
+                self._spawn(d)
+            return
+        # read only as many jobs as there are free slots, so jobs don't sit idle here
+        for d in await self.q.read(self.id, count=free, block_ms=self.block_ms):
+            self._spawn(d)
 
 
 def replay_providers(data_path: str, seed: int) -> dict:
@@ -186,7 +214,8 @@ async def amain(a) -> None:
     pool = await pgstore.connect(a.pg_dsn, a.schema)
     w = Worker(a.id, r, pool, replay_providers(a.data, zlib.crc32(a.id.encode())),
                DEFAULT_PROVIDERS, prefix=a.prefix, concurrency=a.concurrency,
-               min_idle_ms=a.min_idle_ms)
+               min_idle_ms=a.min_idle_ms, inflight_ttl_s=a.inflight_ttl_s,
+               spec_min_free=a.spec_min_free)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, w.stopping.set)   # graceful: finish in-flight jobs
@@ -206,6 +235,10 @@ def main() -> None:
     p.add_argument("--concurrency", type=int, default=16)
     p.add_argument("--min-idle-ms", type=int, default=30_000,
                    help="reclaim jobs idle this long; keep it above ~3x p99 job time")
+    p.add_argument("--inflight-ttl-s", type=int, default=60,
+                   help="how long a dead worker's claim blocks others; keep above max call time")
+    p.add_argument("--spec-min-free", type=float, default=0.3,
+                   help="drop a speculative job unless this fraction of the bucket is free")
     p.add_argument("--prefix", default="")
     p.add_argument("--schema", default=None)
     p.add_argument("--pg-dsn", default=os.environ.get("PG_DSN"))

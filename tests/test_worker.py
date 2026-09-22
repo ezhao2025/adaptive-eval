@@ -136,7 +136,8 @@ def test_inflight_claim_stops_real_and_spec_jobs_paying_twice():
                                          provider_cfgs=cfgs(latency=(0.3, 0.3))))
     assert list(got) == [job(m, it, 0).job_id]     # only the real job posts a result
     assert ok == 1                                 # the provider was paid once
-    assert sum(s["cache_hits"] for s in stats) == 1
+    # the other job either hit the cache or (if speculative) dropped because it was in flight
+    assert sum(s["cache_hits"] + s["spec_dropped"] for s in stats) == 1
 
 
 def test_job_of_dead_worker_is_reclaimed_and_finished():
@@ -176,3 +177,17 @@ def test_fatal_error_posts_error_result_and_acks():
     got, status, pending = asyncio.run(harness(body, n_workers=1))
     assert got[j.job_id]["error"].startswith("LookupError")
     assert status == "fatal" and pending["pending"] == 0
+
+
+def test_speculative_job_is_dropped_when_bucket_has_no_headroom():
+    m, it = DATA["models"][2], DATA["items"][2]
+
+    async def body(q, pool, workers):
+        await q.enqueue(job(m, it, 0, spec=True))
+        await asyncio.sleep(1.0)
+        calls = await pool.fetchval("SELECT COUNT(*) FROM call_attempts")
+        pending = await q.r.xpending(q.stream(DATA["model_provider"][m], True), "workers")
+        return calls, pending, workers[0].stats
+
+    calls, pending, stats = asyncio.run(harness(body, n_workers=1, spec_min_free=1.01))
+    assert calls == 0 and stats["spec_dropped"] == 1 and pending["pending"] == 0

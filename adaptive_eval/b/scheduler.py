@@ -23,6 +23,7 @@ import time
 from dataclasses import asdict, dataclass
 
 import numpy as np
+from redis.exceptions import ResponseError
 from scipy.stats import kendalltau
 
 from .. import data as D
@@ -33,7 +34,16 @@ from ..report import full_reference
 from ..storage import ResponseCache, SessionState
 from . import pgstore
 from .admission import Admission, expected_se_reduction
+from .ratelimit_redis import limiters_for
+from .speculate import Speculator
 from .queue import SCHEDULER, Job, JobQueue, connect, real_job_id
+
+
+def redis_state_lost(e: Exception) -> bool:
+    """Redis restarted or was wiped: groups are gone (NOGROUP), or a stream vanished while
+    we were blocked reading it (UNBLOCKED ... no longer exists)."""
+    msg = str(e)
+    return "NOGROUP" in msg or "no longer exists" in msg
 
 
 class SchedulerCrash(Exception):
@@ -68,13 +78,48 @@ class Scheduler:
         self.available, self.consumer, self.admission = available, consumer, admission
         self.status_every_s, self.log = status_every_s, log
         self.sessions: dict[str, Session] = {}
-        self.stats = dict(results=0, stale_results=0, reenqueued=0, failed=0, budget_stopped=0)
+        self.stats = dict(results=0, stale_results=0, reenqueued=0, failed=0, budget_stopped=0,
+                          next_steps=0, spec_hits=0)
+        self.real_spent = 0.0
+        self._cost_sum: dict[str, float] = {}      # measured cost of paid real calls
+        self._cost_n: dict[str, int] = {}
+        self.speculator: Speculator | None = None
 
     # ---- per-session logic (A's engine, split at the network boundary) -------------
+    def estimate(self, answered: list[tuple[str, int]]) -> tuple[float, float]:
+        ii = np.array([self.idx[i] for i, _ in answered], dtype=int)
+        y = np.array([c for _, c in answered], dtype=float)
+        return estimate_ability(self.bank.a[ii], self.bank.b[ii], y)
+
     def _ability(self, s: Session) -> None:
-        ii = np.array([self.idx[i] for i, _ in s.st.answered], dtype=int)
-        y = np.array([c for _, c in s.st.answered], dtype=float)
-        s.theta, s.se = estimate_ability(self.bank.a[ii], self.bank.b[ii], y)
+        s.theta, s.se = self.estimate(s.st.answered)
+
+    def plan_next(self, session_id: str, model: str,
+                  answered: list[tuple[str, int]]) -> str | None:
+        """Pure: the item the scheduler picks after these answers, or None if it would stop.
+        _advance and the Speculator both use this, so speculation predicts exactly."""
+        theta, se = self.estimate(answered)
+        n, allowed = len(answered), self._allowed(model)
+        pool_size = len(self.bank) if allowed is None else len(allowed)
+        if n >= min(self.cfg.max_items, pool_size) or (
+                n >= self.cfg.min_items and se < self.cfg.se_target):
+            return None
+        used = {self.idx[i] for i, _ in answered}
+        return self.bank.item_ids[select_next(self.cfg.selector, theta, self.bank, used,
+                                              session_id, n, allowed)]
+
+    def cache_key(self, model: str, item_id: str) -> str:
+        return ResponseCache.make_key(model=model, item=item_id, prompt=self.cfg.prompt_version,
+                                      decoding=self.cfg.decoding, sample=self.cfg.sample_idx)
+
+    def expected_cost(self, provider: str) -> float:
+        """Mean measured cost of this provider's paid calls; config estimate until one lands."""
+        if self._cost_n.get(provider):
+            return self._cost_sum[provider] / self._cost_n[provider]
+        if self.admission is not None:
+            return self.admission.expected_cost(provider)
+        c = DEFAULT_PROVIDERS.get(provider)
+        return 0.002 if c is None else c.est_tokens_per_call / 1000 * c.usd_per_1k_input
 
     def _allowed(self, model: str) -> set[int] | None:
         return None if self.available is None else self.available.get(model, set())
@@ -87,8 +132,7 @@ class Scheduler:
             await self.admission.admit(job, priority)
 
     async def _enqueue(self, s: Session, step: int, item_id: str) -> None:
-        key = ResponseCache.make_key(model=s.model, item=item_id, prompt=self.cfg.prompt_version,
-                                     decoding=self.cfg.decoding, sample=self.cfg.sample_idx)
+        key = self.cache_key(s.model, item_id)
         provider = self.model_provider[s.model]
         i = self.idx[item_id]
         gain = expected_se_reduction(
@@ -111,19 +155,17 @@ class Scheduler:
 
     async def _advance(self, s: Session) -> None:
         """Stop, or select the next item, log it (write-ahead) and enqueue it."""
-        n, allowed = len(s.st.answered), self._allowed(s.model)
-        pool_size = len(self.bank) if allowed is None else len(allowed)
-        if n >= min(self.cfg.max_items, pool_size) or (
-                n >= self.cfg.min_items and s.se < self.cfg.se_target):
+        n = len(s.st.answered)
+        item_id = self.plan_next(s.session_id, s.model, s.st.answered)
+        if item_id is None:
             await self.store.finish(s.session_id, s.theta, s.se, n)
             s.done = True
             return
-        used = {self.idx[i] for i, _ in s.st.answered}
-        item_id = self.bank.item_ids[select_next(self.cfg.selector, s.theta, self.bank, used,
-                                                 s.session_id, n, allowed)]
         await self.store.append(s.session_id, n, "item_selected", item_id)
         s.st.pending = (n, item_id)
         await self._enqueue(s, n, item_id)
+        if self.speculator is not None:
+            await self.speculator.on_real_job(s, n, item_id)
 
     async def on_result(self, f: dict) -> None:
         sid, _, step = f["job_id"].rpartition(":")
@@ -154,6 +196,16 @@ class Scheduler:
         s.st.answered.append((item_id, int(f["correct"])))
         s.st.pending = None
         self.stats["results"] += 1
+        if not cached:
+            p, c = self.model_provider[s.model], float(f["cost_usd"])
+            self.real_spent += c
+            self._cost_sum[p] = self._cost_sum.get(p, 0.0) + c
+            self._cost_n[p] = self._cost_n.get(p, 0) + 1
+        if int(step) > 0:                          # step 0 can never be speculated
+            self.stats["next_steps"] += 1
+            if cached and self.speculator is not None and \
+                    f.get("cache_key") in self.speculator.enqueued:
+                self.stats["spec_hits"] += 1
         self._ability(s)
         await self._advance(s)
 
@@ -244,6 +296,27 @@ class Scheduler:
             "SELECT COUNT(*) AS answers, COUNT(*) FILTER (WHERE e.cached=0) AS paid,"
             " COALESCE(SUM(e.cost_usd), 0) AS cost FROM events e JOIN sessions s"
             " USING (session_id) WHERE s.run_name=$1 AND e.type='answer_recorded'", self.run_name)
+        lat = await self.pool.fetchval(
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY finished_at - started_at)"
+            " FROM sessions WHERE run_name=$1 AND status='done'", self.run_name)
+        calls = {r["speculative"]: r for r in await self.pool.fetch(
+            "SELECT speculative, COUNT(*) AS n, COALESCE(SUM(cost_usd), 0) AS usd"
+            " FROM call_attempts WHERE status='ok' GROUP BY 1")}
+        wasted = await self.pool.fetchrow(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(c.cost_usd), 0) AS usd FROM call_attempts c"
+            " WHERE c.speculative AND c.status='ok' AND NOT EXISTS ("
+            "  SELECT 1 FROM events e JOIN sessions s USING (session_id)"
+            "  WHERE s.run_name=$1 AND e.type='answer_recorded'"
+            "  AND s.model=c.model AND e.item_id=c.item_id)", self.run_name)
+        spec = {}
+        if self.speculator is not None:
+            steps = self.stats["next_steps"]
+            spec = {**self.speculator.stats,
+                    "spec_hit_rate": round(self.stats["spec_hits"] / steps, 4) if steps else 0.0,
+                    "spec_calls": calls[True]["n"] if True in calls else 0,
+                    "spec_cost_usd": round(float(calls[True]["usd"]), 4) if True in calls else 0.0,
+                    "wasted_spec_calls": wasted["n"],
+                    "wasted_spec_cost_usd": round(float(wasted["usd"]), 4)}
         extra = {} if self.admission is None else {
             "admission": self.admission.mode, "budget_usd": self.admission.budget,
             "spent_usd": round(self.admission.spent, 4), "windows": self.admission.window,
@@ -252,6 +325,8 @@ class Scheduler:
                 "reached_se_target": row["reached_se_target"], **extra,
                 "answers": ev["answers"], "paid_calls": ev["paid"],
                 "cost_usd": round(float(ev["cost"]), 4), "wall_clock_s": round(wall_s, 2),
+                "median_session_latency_s": None if lat is None else round(float(lat), 3),
+                "real_calls": calls[False]["n"] if False in calls else 0, **spec,
                 **self.stats}
 
 
@@ -268,24 +343,38 @@ async def amain(a) -> None:
         budget_usd=a.budget_usd)
     sched = Scheduler(a.run_name, models, d["model_provider"], bank, pool, q, cfg,
                       available=available_items(d, bank), admission=admission)
+    if a.speculate:
+        sched.speculator = Speculator(sched, limiters_for(r, DEFAULT_PROVIDERS, prefix=a.prefix),
+                                      pgstore.PgResponseCache(pool), min_free=a.spec_min_free,
+                                      max_fraction=a.spec_max_fraction)
     try:
-        if a.exit_after is not None:
-            try:
-                await sched.run(exit_after=a.exit_after)
-            except SchedulerCrash as e:
-                print(f"[sched] {e}; exiting without cleanup", file=sys.stderr)
-                os._exit(1)                         # like kill -9: nothing gets flushed
-        summary = await sched.run()
-        rows = await pool.fetch("SELECT model, theta FROM sessions WHERE run_name=$1"
-                                " AND status IN ('done', 'budget')", a.run_name)
-        if len(rows) > 1:                   # ranking agreement with the full benchmark
-            ref = full_reference(d, bank, [r["model"] for r in rows])
-            summary["kendall_tau_vs_full_theta"] = round(float(kendalltau(
-                [r["theta"] for r in rows], [ref[r["model"]]["theta"] for r in rows])[0]), 4)
-        print(json.dumps(summary, indent=2))
+        return await _run(a, sched, pool, d, bank)
+    except ResponseError as e:
+        if not redis_state_lost(e):
+            raise
+        print("[sched] Redis state was lost (restart or FLUSHALL). Run the same command again:"
+              " it re-enqueues everything pending from Postgres.", file=sys.stderr)
+        sys.exit(3)
     finally:
         await pool.close()
         await r.aclose()
+
+
+async def _run(a, sched, pool, d, bank) -> None:
+    if a.exit_after is not None:
+        try:
+            await sched.run(exit_after=a.exit_after)
+        except SchedulerCrash as e:
+            print(f"[sched] {e}; exiting without cleanup", file=sys.stderr)
+            os._exit(1)                         # like kill -9: nothing gets flushed
+    summary = await sched.run()
+    rows = await pool.fetch("SELECT model, theta FROM sessions WHERE run_name=$1"
+                            " AND status IN ('done', 'budget')", a.run_name)
+    if len(rows) > 1:                   # ranking agreement with the full benchmark
+        ref = full_reference(d, bank, [r["model"] for r in rows])
+        summary["kendall_tau_vs_full_theta"] = round(float(kendalltau(
+            [r["theta"] for r in rows], [ref[r["model"]]["theta"] for r in rows])[0]), 4)
+    print(json.dumps(summary, indent=2))
 
 
 def main() -> None:
@@ -302,6 +391,12 @@ def main() -> None:
     p.add_argument("--budget-usd", type=float, default=None,
                    help="stop admitting paid calls once this much is spent or committed")
     p.add_argument("--window-scale", type=float, default=1.5)
+    p.add_argument("--speculate", action="store_true",
+                   help="prefetch both possible next items while a call is in flight")
+    p.add_argument("--spec-max-fraction", type=float, default=0.2,
+                   help="hard cap: speculative spend as a fraction of total spend")
+    p.add_argument("--spec-min-free", type=float, default=0.3,
+                   help="speculate only if this fraction of the provider's bucket is free")
     p.add_argument("--exit-after", type=int, default=None,
                    help="simulate a crash after this many answers (fault testing)")
     p.add_argument("--prefix", default="")
