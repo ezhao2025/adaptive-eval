@@ -181,6 +181,29 @@ $1.10. The SE-reduction-per-dollar rule, the original design, won neither metric
 rule depends on whether the goal is finished evaluations or a good leaderboard. Raw tables
 are in `results/admission/`.
 
+### Speculative prefetch
+
+While a session waits on an item, the scheduler computes the two items it would pick next,
+one per possible outcome, and prefetches them into the cache. Item selection is
+deterministic, so these are exact predictions. Speculative jobs only warm the cache and
+never write session events, so speculation cannot change results. Two guards protect real
+work: a provider must have at least 30% of its rate-limit capacity free, and speculative
+spend is capped at 20% of total spend.
+
+60 sessions, 3 repeats each (mean):
+
+| | Wall clock | Median session | Total cost | Spec hit rate | Wasted spec $ |
+|---|---:|---:|---:|---:|---:|
+| Off | 17.7 s | 5.56 s | $1.385 | - | - |
+| On, 30% free-capacity guard | 17.8 s | 5.76 s | $1.397 (+0.9%) | 2% | $0.012 |
+| On, no guard | 19.4 s (+9%) | 5.70 s | $1.448 (+4.5%) | 14% | $0.063 |
+
+Speculation never changed results (identical in all 12 runs). In this rate-limited replay
+setup it gave no speedup: with the guard it fired rarely, and without the guard it hit 14%
+of next steps but made runs 9% slower and 4.5% more expensive by competing with real calls
+for rate-limit capacity. Speculation can only reuse spare capacity; it should pay off when
+calls are slow and rate limits are loose, which this benchmark does not exercise.
+
 ## Roadmap
 
 - **Real provider:** finish `AnthropicProvider` (retry only on 429, 5xx and connection errors),
