@@ -151,6 +151,36 @@ diff <(python -m adaptive_eval.cli report --run-name demo --db data/crash.db) \
      <(python -m adaptive_eval.cli report --run-name demo --db data/clean.db)
 ```
 
+## Design B (in progress): distributed evaluation
+
+A scheduler process and a pool of stateless workers, coordinated through Redis Streams,
+with an atomic Redis rate limiter shared by all workers and Postgres as the source of truth.
+On the same data, a distributed run reproduces Design A's results exactly (same theta to
+9 decimals, same item counts), including when the scheduler is killed mid-run and restarted.
+
+**The scheduler is a single point of failure by design.** It is recoverable, not highly
+available: on restart it rebuilds every session from the Postgres event log, re-enqueues
+pending steps (duplicates are harmless because every write is idempotent), and takes over
+results it had received but not acknowledged.
+
+### Admission under a budget
+
+When the budget is scarce, the order in which ready sessions get calls matters. Three rules,
+60 sessions, 5 repeats each (mean; sd at most 0.9 sessions and 0.009 tau):
+
+| Budget | Metric | FIFO | SE reduction per $ (breadth) | Fewest calls to target (depth) |
+|---|---|---:|---:|---:|
+| $0.80 | Sessions reaching SE target | 9.0 | 5.2 | **25.4** |
+| | Kendall tau vs full benchmark | 0.715 | 0.720 | 0.712 |
+| $1.10 | Sessions reaching SE target | 24.8 | 20.2 | **37.0** |
+| | Kendall tau vs full benchmark | **0.780** | 0.767 | 0.724 |
+
+The rule trades completion against ranking quality. Depth-first admission completed 2.8x
+more sessions than FIFO at $0.80 and 49% more at $1.10, but lowered ranking agreement at
+$1.10. The SE-reduction-per-dollar rule, the original design, won neither metric. The right
+rule depends on whether the goal is finished evaluations or a good leaderboard. Raw tables
+are in `results/admission/`.
+
 ## Roadmap
 
 - **Real provider:** finish `AnthropicProvider` (retry only on 429, 5xx and connection errors),
