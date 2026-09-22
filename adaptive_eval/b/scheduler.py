@@ -35,6 +35,7 @@ from ..storage import ResponseCache, SessionState
 from . import pgstore
 from .admission import Admission, expected_se_reduction
 from .ratelimit_redis import limiters_for
+from .sim import add_args, provider_configs
 from .speculate import Speculator
 from .queue import SCHEDULER, Job, JobQueue, connect, real_job_id
 
@@ -338,13 +339,14 @@ async def amain(a) -> None:
     r = connect(a.redis_url)
     pool = await pgstore.connect(a.pg_dsn, a.schema)
     q = JobQueue(r, sorted(set(d["model_provider"].values())), a.prefix)
+    cfgs = provider_configs(a.rate_scale, a.latency_scale)
     admission = None if a.admission == "none" else Admission(
-        q, DEFAULT_PROVIDERS, mode=a.admission, window_scale=a.window_scale,
+        q, cfgs, mode=a.admission, window_scale=a.window_scale,
         budget_usd=a.budget_usd)
     sched = Scheduler(a.run_name, models, d["model_provider"], bank, pool, q, cfg,
                       available=available_items(d, bank), admission=admission)
     if a.speculate:
-        sched.speculator = Speculator(sched, limiters_for(r, DEFAULT_PROVIDERS, prefix=a.prefix),
+        sched.speculator = Speculator(sched, limiters_for(r, cfgs, prefix=a.prefix),
                                       pgstore.PgResponseCache(pool), min_free=a.spec_min_free,
                                       max_fraction=a.spec_max_fraction)
     try:
@@ -391,6 +393,7 @@ def main() -> None:
     p.add_argument("--budget-usd", type=float, default=None,
                    help="stop admitting paid calls once this much is spent or committed")
     p.add_argument("--window-scale", type=float, default=1.5)
+    add_args(p)
     p.add_argument("--speculate", action="store_true",
                    help="prefetch both possible next items while a call is in flight")
     p.add_argument("--spec-max-fraction", type=float, default=0.2,

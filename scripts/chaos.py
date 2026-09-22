@@ -142,6 +142,8 @@ async def fetch_results(schema: str):
     try:
         rows = await conn.fetch(f'SELECT model, theta, n_items, status FROM "{schema}".sessions'
                                 " WHERE run_name=$1 ORDER BY model", RUN_NAME)
+        paid = await conn.fetchval(
+            f'SELECT COUNT(*) FROM "{schema}".call_attempts WHERE status=\'ok\'')
         orphans = await conn.fetchval(
             f'SELECT COUNT(*) FROM (SELECT session_id, step FROM "{schema}".events'
             f" WHERE type='item_selected' EXCEPT SELECT session_id, step FROM \"{schema}\".events"
@@ -149,7 +151,8 @@ async def fetch_results(schema: str):
         await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
     finally:
         await conn.close()
-    return [(r["model"], round(r["theta"], 9), r["n_items"], r["status"]) for r in rows], orphans
+    return ([(r["model"], round(r["theta"], 9), r["n_items"], r["status"]) for r in rows],
+            orphans, paid)
 
 
 def execute(a, label: str, faults: list[str], speculate: bool = False):
@@ -166,7 +169,8 @@ def execute(a, label: str, faults: list[str], speculate: bool = False):
         run.finish()
     finally:
         run.stop()
-    rows, orphans = asyncio.run(fetch_results(run.tag))
+    rows, orphans, paid = asyncio.run(fetch_results(run.tag))
+    run.paid = paid
     return rows, orphans, done, run
 
 
@@ -196,9 +200,11 @@ def main() -> None:
     random.seed(a.seed)
 
     t0 = time.monotonic()
-    clean, clean_orphans, _, _ = execute(a, "clean", [])
+    clean, clean_orphans, _, clean_run = execute(a, "clean", [])
+    base = clean_run.paid
     print(f"clean run: {len(clean)} sessions, all done={all(r[3] == 'done' for r in clean)},"
-          f" orphans={clean_orphans}  ({time.monotonic() - t0:.0f}s)")
+          f" orphans={clean_orphans}, {base} paid calls  ({time.monotonic() - t0:.0f}s)")
+    extra: dict[str, list[int]] = {}
 
     failures = 0
     for rep in range(a.repeat):
@@ -212,12 +218,19 @@ def main() -> None:
             done = done or ["none (speculation on)"]
             ok = rows == clean and orphans == 0
             failures += not ok
+            if not spec and sc != "speculate":    # speculation adds its own calls
+                extra.setdefault(sc, []).append(run.paid - base)
             print(f"{'PASS' if ok else 'FAIL'}  {sc:12s} faults: {'; '.join(done)}"
-                  f"  (scheduler restarts: {run.sched_restarts})")
+                  f"  (scheduler restarts: {run.sched_restarts}, extra paid calls:"
+                  f" {run.paid - base:+d})")
             if not ok:
                 diff = [(c, g) for c, g in zip(clean, rows) if c != g][:5]
                 print(f"      orphans={orphans}, first differences (clean, got): {diff}"
                       f"\n      log: /tmp/{run.tag}.log")
+    if extra:
+        print(f"\nrecovery cost: extra paid calls vs the clean run ({base} calls)")
+        for sc, xs in extra.items():
+            print(f"  {sc:12s} mean {sum(xs) / len(xs):+.1f}  (runs: {xs})")
     print(f"\n{'ALL PASSED' if not failures else f'{failures} FAILED'}")
     sys.exit(1 if failures else 0)
 

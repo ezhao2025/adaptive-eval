@@ -4,6 +4,8 @@ Each arm gets fresh workers, a fresh Postgres schema and Redis prefix (no shared
 Results must be identical; what changes is cost and speed.
 
     python scripts/speculation_experiment.py --reps 3
+    python scripts/speculation_experiment.py --se-targets 0.2,0.3,0.4 --rate-scale 20 \
+        --latency-scale 4 --reps 3          # latency-bound regime: slow calls, loose limits
 """
 from __future__ import annotations
 
@@ -24,9 +26,10 @@ import uuid  # noqa: E402
 import asyncpg  # noqa: E402
 
 
-def run_arm(a, speculate: bool, rep: int) -> tuple[dict, list]:
+def run_arm(a, speculate: bool, rep: int, se_target: float) -> tuple[dict, list]:
     tag = f"spec_{'on' if speculate else 'off'}_{rep}_{uuid.uuid4().hex[:6]}"
-    common = ["--schema", tag, "--prefix", f"{tag}:"]
+    common = ["--schema", tag, "--prefix", f"{tag}:",
+              "--rate-scale", str(a.rate_scale), "--latency-scale", str(a.latency_scale)]
     workers = [subprocess.Popen([sys.executable, "-m", "adaptive_eval.b.worker", "--id", f"w{i}",
                                  "--data", a.data, "--spec-min-free", str(a.spec_min_free),
                                  *common],
@@ -37,7 +40,7 @@ def run_arm(a, speculate: bool, rep: int) -> tuple[dict, list]:
         out = subprocess.run(
             [sys.executable, "-m", "adaptive_eval.b.scheduler", "--run-name", "spec-exp",
              "--data", a.data, "--params", a.params, "--models", a.models,
-             "--se-target", str(a.se_target), "--admission", "none", *common,
+             "--se-target", str(se_target), "--admission", "none", *common,
              *(["--speculate", "--spec-max-fraction", str(a.max_fraction),
                 "--spec-min-free", str(a.spec_min_free)] if speculate else [])],
             capture_output=True, text=True, timeout=a.timeout)
@@ -70,7 +73,9 @@ def main() -> None:
     p.add_argument("--data", default="data/synthetic.json")
     p.add_argument("--params", default="data/irt_params.json")
     p.add_argument("--models", default="all")
-    p.add_argument("--se-target", type=float, default=0.3)
+    p.add_argument("--se-targets", default="0.3", help="comma list, e.g. 0.2,0.3,0.4")
+    p.add_argument("--rate-scale", type=float, default=1.0)
+    p.add_argument("--latency-scale", type=float, default=1.0)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--max-fraction", type=float, default=0.2)
     p.add_argument("--spec-min-free", type=float, default=0.3,
@@ -80,15 +85,20 @@ def main() -> None:
     if not (os.environ.get("PG_DSN") and os.environ.get("REDIS_URL")):
         sys.exit("set PG_DSN and REDIS_URL (source .env.sh)")
 
+    for se_target in (float(x) for x in a.se_targets.split(",")):
+        report(a, se_target)
+
+
+def report(a, se_target: float) -> None:
     arms = {"off": [], "on": []}
     reference = None
     for rep in range(a.reps):
         for name in arms:
-            s, rows = run_arm(a, name == "on", rep)
+            s, rows = run_arm(a, name == "on", rep, se_target)
             reference = reference or rows
             s["identical"] = rows == reference
             arms[name].append(s)
-            print(f"rep {rep} spec={name:3s} identical={s['identical']}"
+            print(f"se={se_target} rep {rep} spec={name:3s} identical={s['identical']}"
                   f"  wall={s['wall_clock_s']:.1f}s  median_session={s['median_session_latency_s']}s"
                   f"  cost=${s['cost_usd'] + s.get('spec_cost_usd', 0):.4f}"
                   + (f"  hit_rate={s['spec_hit_rate']:.2f}"
@@ -98,7 +108,8 @@ def main() -> None:
     def ms(xs):
         return f"{statistics.mean(xs):.3f} ± {statistics.stdev(xs):.3f}" if len(xs) > 1 \
             else f"{xs[0]:.3f}"
-    print(f"\n{a.reps} reps (mean ± sd); results identical in every run: "
+    print(f"\nse_target={se_target}, rate x{a.rate_scale}, latency x{a.latency_scale}, "
+          f"{a.reps} reps (mean ± sd); results identical in every run: "
           f"{all(s['identical'] for rs in arms.values() for s in rs)}")
     print(f"{'spec':5s} {'wall clock s':>16s} {'median session s':>18s} {'total cost $':>16s}"
           f" {'spec hit rate':>16s} {'wasted spec $':>16s}")

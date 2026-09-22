@@ -36,6 +36,7 @@ from ..providers import DEFAULT_PROVIDERS, ReplayProvider, TransientError
 from . import pgstore
 from .queue import Delivery, JobQueue, connect
 from .ratelimit_redis import limiters_for
+from .sim import add_args, provider_configs
 
 def redis_state_lost(e: Exception) -> bool:
     """Redis restarted or was wiped: groups are gone (NOGROUP), or a stream vanished while
@@ -202,18 +203,20 @@ class Worker:
             self._spawn(d)
 
 
-def replay_providers(data_path: str, seed: int) -> dict:
+def replay_providers(data_path: str, seed: int, cfgs: dict | None = None) -> dict:
     d = D.load(data_path)
     responses = {(m, it): bool(d["R"][i, j]) for i, m in enumerate(d["models"])
                  for j, it in enumerate(d["items"]) if not np.isnan(d["R"][i, j])}
-    return {n: ReplayProvider(n, c, responses, seed) for n, c in DEFAULT_PROVIDERS.items()}
+    return {n: ReplayProvider(n, c, responses, seed)
+            for n, c in (cfgs or DEFAULT_PROVIDERS).items()}
 
 
 async def amain(a) -> None:
     r = connect(a.redis_url)
     pool = await pgstore.connect(a.pg_dsn, a.schema)
-    w = Worker(a.id, r, pool, replay_providers(a.data, zlib.crc32(a.id.encode())),
-               DEFAULT_PROVIDERS, prefix=a.prefix, concurrency=a.concurrency,
+    cfgs = provider_configs(a.rate_scale, a.latency_scale)
+    w = Worker(a.id, r, pool, replay_providers(a.data, zlib.crc32(a.id.encode()), cfgs),
+               cfgs, prefix=a.prefix, concurrency=a.concurrency,
                min_idle_ms=a.min_idle_ms, inflight_ttl_s=a.inflight_ttl_s,
                spec_min_free=a.spec_min_free)
     loop = asyncio.get_running_loop()
@@ -239,6 +242,7 @@ def main() -> None:
                    help="how long a dead worker's claim blocks others; keep above max call time")
     p.add_argument("--spec-min-free", type=float, default=0.3,
                    help="drop a speculative job unless this fraction of the bucket is free")
+    add_args(p)
     p.add_argument("--prefix", default="")
     p.add_argument("--schema", default=None)
     p.add_argument("--pg-dsn", default=os.environ.get("PG_DSN"))
