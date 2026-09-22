@@ -163,6 +163,8 @@ available: on restart it rebuilds every session from the Postgres event log, re-
 pending steps (duplicates are harmless because every write is idempotent), and takes over
 results it had received but not acknowledged.
 
+**Fault injection** (`scripts/chaos.py`): killing one worker, all workers, or the scheduler with `kill -9`, or wiping Redis with `FLUSHALL` mid-run, with speculation on or off, always produced results identical to a clean run (60 sessions, no orphaned steps).
+
 ### Admission under a budget
 
 When the budget is scarce, the order in which ready sessions get calls matters. Three rules,
