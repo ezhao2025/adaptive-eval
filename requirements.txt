@@ -2,3 +2,5 @@ numpy>=1.26
 scipy>=1.11
 pytest>=8
 # anthropic>=0.40   # only when you switch to a real provider
+redis>=5
+asyncpg>=0.29
