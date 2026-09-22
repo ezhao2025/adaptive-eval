@@ -10,6 +10,7 @@ import pytest
 
 from adaptive_eval import data as D
 from adaptive_eval.b import pgstore
+from adaptive_eval.b.admission import Admission
 from adaptive_eval.b.queue import JobQueue, connect
 from adaptive_eval.b.scheduler import Scheduler, SchedulerCrash, available_items
 from adaptive_eval.b.worker import Worker
@@ -63,7 +64,8 @@ def responses(d, drop_model=None):
             for j, it in enumerate(d["items"]) if m != drop_model}
 
 
-async def run_b(d, bank, *, crash_after=None, drop_model=None, n_workers=3):
+async def run_b(d, bank, *, crash_after=None, drop_model=None, n_workers=3, admission=None):
+    """admission: None, or dict of Admission kwargs (a fresh controller per scheduler)."""
     schema, prefix = f"t_{uuid.uuid4().hex[:8]}", f"t{uuid.uuid4().hex[:8]}:"
     r = connect(URL)
     pool = await pgstore.connect(DSN, schema)
@@ -73,10 +75,15 @@ async def run_b(d, bank, *, crash_after=None, drop_model=None, n_workers=3):
                       FAST, prefix=prefix, block_ms=100) for i in range(n_workers)]
     runs = [asyncio.create_task(w.run()) for w in workers]
 
+    controllers = []
+
     def scheduler():
-        return Scheduler("eq", d["models"], d["model_provider"], bank, pool,
-                         JobQueue(r, list(FAST), prefix), CFG,
-                         available=available_items(d, bank), log=lambda *_: None)
+        q = JobQueue(r, list(FAST), prefix)
+        adm = None if admission is None else Admission(q, FAST, **admission)
+        controllers.append(adm)
+        return Scheduler("eq", d["models"], d["model_provider"], bank, pool, q, CFG,
+                         available=available_items(d, bank), admission=adm,
+                         log=lambda *_: None)
     crashed = False
     try:
         if crash_after is not None:
@@ -87,6 +94,9 @@ async def run_b(d, bank, *, crash_after=None, drop_model=None, n_workers=3):
         summary = await asyncio.wait_for(scheduler().run(), 60)   # a fresh scheduler "process"
         rows = await pool.fetch("SELECT model, theta, n_items, status FROM sessions"
                                 " WHERE run_name='eq' ORDER BY model")
+        summary["_paid_cost"] = float(await pool.fetchval(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM events WHERE type='answer_recorded'"))
+        summary["_controllers"] = controllers
         orphans = await pool.fetchval(
             "SELECT COUNT(*) FROM (SELECT session_id, step FROM events WHERE type='item_selected'"
             " EXCEPT SELECT session_id, step FROM events WHERE type='answer_recorded') x")
@@ -131,3 +141,29 @@ def test_fatal_error_fails_only_that_session(setup):
     assert all(s == "done" for m, s in status.items() if m != bad)
     good = sorted((r["model"], round(r["theta"], 9), r["n_items"]) for r in rows if r["model"] != bad)
     assert good == [x for x in ref if x[0] != bad]
+
+
+@pytest.mark.parametrize("mode", ["priority", "nearest"])
+def test_priority_admission_changes_order_not_results(setup, mode):
+    """Admission reorders calls across sessions; each session's own item sequence is
+    deterministic, so final results must still equal Design A exactly."""
+    d, bank, ref = setup
+    summary, rows, orphans, _ = asyncio.run(
+        run_b(d, bank, admission=dict(mode=mode, windows={p: 2 for p in FAST})))
+    got = sorted((r["model"], round(r["theta"], 9), r["n_items"]) for r in rows)
+    assert got == ref and orphans == 0
+    adm = summary["_controllers"][-1]
+    assert all(adm.max_inflight[p] <= 2 for p in FAST)          # the window held
+
+
+@pytest.mark.parametrize("mode", ["priority", "nearest", "fifo"])
+def test_budget_stops_the_run_without_overspending(setup, mode):
+    d, bank, _ = setup
+    full = asyncio.run(run_b(d, bank))[0]["_paid_cost"]
+    budget = full / 3
+    summary, rows, _, _ = asyncio.run(
+        run_b(d, bank, admission=dict(mode=mode, budget_usd=budget, windows={p: 2 for p in FAST})))
+    statuses = {r["status"] for r in rows}
+    assert "budget" in statuses and statuses <= {"done", "budget"}
+    assert summary["_paid_cost"] <= budget * 1.05            # committed-cost accounting
+    assert summary["budget_stopped"] > 0

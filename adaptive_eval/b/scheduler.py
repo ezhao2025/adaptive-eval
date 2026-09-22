@@ -23,12 +23,16 @@ import time
 from dataclasses import asdict, dataclass
 
 import numpy as np
+from scipy.stats import kendalltau
 
 from .. import data as D
 from ..engine import SessionConfig
-from ..irt import ItemBank, estimate_ability, select_next
+from ..irt import ItemBank, estimate_ability, fisher_information, select_next
+from ..providers import DEFAULT_PROVIDERS
+from ..report import full_reference
 from ..storage import ResponseCache, SessionState
 from . import pgstore
+from .admission import Admission, expected_se_reduction
 from .queue import SCHEDULER, Job, JobQueue, connect, real_job_id
 
 
@@ -57,14 +61,14 @@ class Scheduler:
     def __init__(self, run_name: str, models: list[str], model_provider: dict[str, str],
                  bank: ItemBank, pool, q: JobQueue, cfg: SessionConfig, *,
                  available: dict[str, set[int]] | None = None, consumer: str = "sched",
-                 status_every_s: float = 5.0, log=print):
+                 admission: Admission | None = None, status_every_s: float = 5.0, log=print):
         self.run_name, self.models, self.model_provider = run_name, list(models), model_provider
         self.bank, self.idx, self.pool, self.q, self.cfg = bank, bank.index(), pool, q, cfg
         self.store = pgstore.PgEventStore(pool)
-        self.available, self.consumer = available, consumer
+        self.available, self.consumer, self.admission = available, consumer, admission
         self.status_every_s, self.log = status_every_s, log
         self.sessions: dict[str, Session] = {}
-        self.stats = dict(results=0, stale_results=0, reenqueued=0, failed=0)
+        self.stats = dict(results=0, stale_results=0, reenqueued=0, failed=0, budget_stopped=0)
 
     # ---- per-session logic (A's engine, split at the network boundary) -------------
     def _ability(self, s: Session) -> None:
@@ -75,15 +79,35 @@ class Scheduler:
     def _allowed(self, model: str) -> set[int] | None:
         return None if self.available is None else self.available.get(model, set())
 
-    async def admit(self, job: Job) -> None:
-        """Hand a job to the workers. Step 7 replaces this with priority admission."""
-        await self.q.enqueue(job)
+    async def admit(self, job: Job, priority: float) -> None:
+        """Hand a job to the workers, directly or through windowed priority admission."""
+        if self.admission is None:
+            await self.q.enqueue(job)
+        else:
+            await self.admission.admit(job, priority)
 
     async def _enqueue(self, s: Session, step: int, item_id: str) -> None:
         key = ResponseCache.make_key(model=s.model, item=item_id, prompt=self.cfg.prompt_version,
                                      decoding=self.cfg.decoding, sample=self.cfg.sample_idx)
-        await self.admit(Job(real_job_id(s.session_id, step), self.model_provider[s.model],
-                             s.model, item_id, key, False))
+        provider = self.model_provider[s.model]
+        i = self.idx[item_id]
+        gain = expected_se_reduction(
+            s.se, float(fisher_information(s.theta, self.bank.a[i:i + 1], self.bank.b[i:i + 1])[0]))
+        await self.admit(Job(real_job_id(s.session_id, step), provider, s.model, item_id, key,
+                             False), priority=self._priority(s, i, provider, gain))
+
+    def _priority(self, s: Session, item: int, provider: str, gain: float) -> float:
+        if self.admission is None:
+            return 0.0
+        if self.admission.mode == "nearest":
+            # fewest calls left to finish = highest priority: finish sessions, don't spread
+            info_item = float(fisher_information(s.theta, self.bank.a[item:item + 1],
+                                                 self.bank.b[item:item + 1])[0])
+            info_needed = max(0.0, 1 / self.cfg.se_target ** 2 - 1 / s.se ** 2)
+            calls_left = max(self.cfg.min_items - len(s.st.answered),
+                             info_needed / max(info_item, 1e-9))
+            return -calls_left
+        return gain / self.admission.expected_cost(provider)     # SE reduction per dollar
 
     async def _advance(self, s: Session) -> None:
         """Stop, or select the next item, log it (write-ahead) and enqueue it."""
@@ -104,6 +128,10 @@ class Scheduler:
     async def on_result(self, f: dict) -> None:
         sid, _, step = f["job_id"].rpartition(":")
         s = self.sessions.get(sid)
+        if s is not None and self.admission is not None:    # free the window slot first
+            paid = not f.get("error") and f.get("cached") == "0"
+            await self.admission.release(self.model_provider[s.model], f["job_id"],
+                                         float(f.get("cost_usd") or 0.0), paid)
         # duplicates (reclaimed or re-enqueued jobs) and other runs' results are dropped
         if s is None or s.done or s.st.pending is None or s.st.pending[0] != int(step):
             self.stats["stale_results"] += 1
@@ -138,7 +166,7 @@ class Scheduler:
                                             asdict(self.cfg))
             status = await self.pool.fetchval("SELECT status FROM sessions WHERE session_id=$1",
                                               sid)
-            if status in ("done", "failed"):
+            if status in ("done", "failed", "budget"):
                 continue
             s = Session(sid, m, await self.store.load_state(sid))
             self._ability(s)
@@ -182,6 +210,9 @@ class Scheduler:
             await self._handle_batch(batch, exit_after)
         last_status = time.monotonic()
         while self.pending_sessions():
+            if self.admission is not None and self.admission.budget_exhausted():
+                await self._stop_for_budget()
+                break
             batch = await self.q.read_results(self.consumer, count=200, block_ms=1000)
             await self._handle_batch(batch, exit_after)
             if time.monotonic() - last_status >= self.status_every_s:
@@ -190,16 +221,35 @@ class Scheduler:
                          f"/{len(self.sessions)} done, {self.stats['results']} answers")
         return await self.summary(time.time() - t0)
 
+    async def _stop_for_budget(self) -> None:
+        """Budget spent: freeze every unfinished session at its current estimate."""
+        for s in self.sessions.values():
+            if not s.done:
+                await self.pool.execute(
+                    "UPDATE sessions SET status='budget', theta=$1, se=$2, n_items=$3,"
+                    " finished_at=$4 WHERE session_id=$5",
+                    s.theta, s.se, len(s.st.answered), time.time(), s.session_id)
+                s.done = True
+                self.stats["budget_stopped"] += 1
+        self.log(f"[sched] {self.run_name}: budget exhausted, "
+                 f"{self.stats['budget_stopped']} sessions stopped early")
+
     async def summary(self, wall_s: float) -> dict:
         row = await self.pool.fetchrow(
             "SELECT COUNT(*) FILTER (WHERE s.status='done') AS done,"
-            " COUNT(*) FILTER (WHERE s.status='failed') AS failed FROM sessions s"
-            " WHERE s.run_name=$1", self.run_name)
+            " COUNT(*) FILTER (WHERE s.status='failed') AS failed,"
+            " COUNT(*) FILTER (WHERE s.se < $2) AS reached_se_target FROM sessions s"
+            " WHERE s.run_name=$1", self.run_name, self.cfg.se_target)
         ev = await self.pool.fetchrow(
             "SELECT COUNT(*) AS answers, COUNT(*) FILTER (WHERE e.cached=0) AS paid,"
             " COALESCE(SUM(e.cost_usd), 0) AS cost FROM events e JOIN sessions s"
             " USING (session_id) WHERE s.run_name=$1 AND e.type='answer_recorded'", self.run_name)
+        extra = {} if self.admission is None else {
+            "admission": self.admission.mode, "budget_usd": self.admission.budget,
+            "spent_usd": round(self.admission.spent, 4), "windows": self.admission.window,
+            "max_inflight": self.admission.max_inflight}
         return {"run": self.run_name, "done": row["done"], "failed": row["failed"],
+                "reached_se_target": row["reached_se_target"], **extra,
                 "answers": ev["answers"], "paid_calls": ev["paid"],
                 "cost_usd": round(float(ev["cost"]), 4), "wall_clock_s": round(wall_s, 2),
                 **self.stats}
@@ -212,9 +262,12 @@ async def amain(a) -> None:
     cfg = SessionConfig(selector=a.selector, se_target=a.se_target, max_items=a.max_items)
     r = connect(a.redis_url)
     pool = await pgstore.connect(a.pg_dsn, a.schema)
-    sched = Scheduler(a.run_name, models, d["model_provider"], bank, pool,
-                      JobQueue(r, sorted(set(d["model_provider"].values())), a.prefix), cfg,
-                      available=available_items(d, bank))
+    q = JobQueue(r, sorted(set(d["model_provider"].values())), a.prefix)
+    admission = None if a.admission == "none" else Admission(
+        q, DEFAULT_PROVIDERS, mode=a.admission, window_scale=a.window_scale,
+        budget_usd=a.budget_usd)
+    sched = Scheduler(a.run_name, models, d["model_provider"], bank, pool, q, cfg,
+                      available=available_items(d, bank), admission=admission)
     try:
         if a.exit_after is not None:
             try:
@@ -222,7 +275,14 @@ async def amain(a) -> None:
             except SchedulerCrash as e:
                 print(f"[sched] {e}; exiting without cleanup", file=sys.stderr)
                 os._exit(1)                         # like kill -9: nothing gets flushed
-        print(json.dumps(await sched.run(), indent=2))
+        summary = await sched.run()
+        rows = await pool.fetch("SELECT model, theta FROM sessions WHERE run_name=$1"
+                                " AND status IN ('done', 'budget')", a.run_name)
+        if len(rows) > 1:                   # ranking agreement with the full benchmark
+            ref = full_reference(d, bank, [r["model"] for r in rows])
+            summary["kendall_tau_vs_full_theta"] = round(float(kendalltau(
+                [r["theta"] for r in rows], [ref[r["model"]]["theta"] for r in rows])[0]), 4)
+        print(json.dumps(summary, indent=2))
     finally:
         await pool.close()
         await r.aclose()
@@ -237,6 +297,11 @@ def main() -> None:
     p.add_argument("--se-target", type=float, default=0.30)
     p.add_argument("--max-items", type=int, default=100)
     p.add_argument("--models", default="test", help="'test' (held-out models) or 'all'")
+    p.add_argument("--admission", choices=["priority", "nearest", "fifo", "none"],
+                   default="priority")
+    p.add_argument("--budget-usd", type=float, default=None,
+                   help="stop admitting paid calls once this much is spent or committed")
+    p.add_argument("--window-scale", type=float, default=1.5)
     p.add_argument("--exit-after", type=int, default=None,
                    help="simulate a crash after this many answers (fault testing)")
     p.add_argument("--prefix", default="")
