@@ -128,3 +128,18 @@ def test_append_is_idempotent_and_batched_on_postgres():
 
     n, st = asyncio.run(main())
     assert n == 2 and st.answered == [("i1", 1)] and st.pending is None
+
+
+def test_many_processes_can_connect_at_once():
+    """Regression: concurrent CREATE ... IF NOT EXISTS used to crash all but one worker."""
+    schema = f"t_{uuid.uuid4().hex[:8]}"
+
+    async def main():
+        try:
+            pools = await asyncio.gather(*(pgstore.connect(DSN, schema) for _ in range(6)))
+            for p in pools:
+                await p.close()
+        finally:
+            await drop([schema])
+
+    asyncio.run(main())

@@ -39,20 +39,28 @@ CREATE INDEX IF NOT EXISTS call_attempts_provider_ts ON call_attempts (provider,
 _STATUS = {"ok": "ok", "transient_error": "transient", "error": "fatal"}
 
 
+_DDL_LOCK = 727_274   # any constant; serializes table creation across processes
+
+
 async def connect(dsn: str, schema: str | None = None, max_size: int = 10) -> asyncpg.Pool:
-    """Open a pool and create the tables. `schema` isolates a run (tests use a fresh one)."""
-    settings = {}
-    if schema:
-        conn = await asyncpg.connect(dsn)
+    """Open a pool and create the tables. `schema` isolates a run (tests use a fresh one).
+
+    CREATE ... IF NOT EXISTS is not safe when several processes run it at the same moment
+    (they race on the system catalogs), so DDL runs under a Postgres advisory lock."""
+    conn = await asyncpg.connect(dsn)
+    try:
+        await conn.execute("SELECT pg_advisory_lock($1)", _DDL_LOCK)
         try:
-            await conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+            if schema:
+                await conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+                await conn.execute(f'SET search_path TO "{schema}"')
+            await conn.execute(SCHEMA)
         finally:
-            await conn.close()
-        settings["search_path"] = schema
-    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=max_size,
-                                     server_settings=settings)
-    await pool.execute(SCHEMA)
-    return pool
+            await conn.execute("SELECT pg_advisory_unlock($1)", _DDL_LOCK)
+    finally:
+        await conn.close()
+    return await asyncpg.create_pool(dsn, min_size=1, max_size=max_size,
+                                     server_settings={"search_path": schema} if schema else {})
 
 
 class PgResponseCache:
