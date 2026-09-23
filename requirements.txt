@@ -6,3 +6,4 @@ redis>=5
 asyncpg>=0.29
 anthropic>=0.40
 anthropic>=0.40
+pillow>=10
