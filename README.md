@@ -259,8 +259,15 @@ multidimensional theta changes what `estimate_ability`, `fisher_information`, an
   this count misses.
 - **Redis is a single instance with no persistence guarantees.** That is acceptable only
   because Postgres is the source of truth: wiping Redis mid-run loses work, not results.
-- **The providers are simulated.** Latency and failure distributions will not match real
-  APIs. The next step is a retest against a real provider on a small budget.
+- **The benchmark results use simulated providers.** Latency and failure distributions do
+  not match real APIs: replay calls take ~50 ms, the live API ~1.2 s per call, which is the
+  latency-bound regime where speculation would matter most and the experiments here do not
+  reach. The real provider itself is verified end to end (`adaptive_eval/real_provider.py`):
+  a 10-call live run cost $0.0005 and exercised auth, grading, retry classification, and
+  per-token cost accounting.
+- **Rate limits must admit a single call.** `tpm / 60 * burst_s` has to exceed a call's
+  estimated tokens, or the limiter rejects the call up front (rather than waiting forever
+  for a bucket that can never fill).
 
 ## Roadmap
 
