@@ -249,6 +249,53 @@ decisions can be audited and replayed. `irt.py` keeps a stable interface: a
 multidimensional theta changes what `estimate_ability`, `fisher_information`, and
 `select_next` return, not how they are called.
 
+## Spatial benchmark (VLM items)
+
+A procedural benchmark in the style of Spatial-IQ (Rim et al.): stacked-cube structures
+rendered isometrically in pure Python, with ground truth taken from the scene description,
+so items are cheap to make and cannot be mislabelled. Each scene yields counting items
+(visible, total, hidden, tallest stack) and relation items (left/right, higher, nearer).
+Visibility is measured by re-rendering each cube in its own ID colour and reading back which
+survive: a rule-based test is wrong, because a cube can be fully covered by a combination of
+neighbours rather than by any single one.
+
+202 items across four difficulty tiers, four models, every model answered every item
+(808 calls, $13.37):
+
+| Model | Accuracy |
+|---|---:|
+| Claude Opus 5.5 | 0.59 |
+| Claude Sonnet 5 | 0.55 |
+| Claude Opus 5 | 0.49 |
+| Claude Haiku 4.5 | 0.45 |
+
+Accuracy by sub-task, pooled over models:
+
+| Sub-task | Accuracy |
+|---|---:|
+| relation_left_right | 1.00 |
+| relation_height | 0.89 |
+| relation_near_far | 0.70 |
+| tallest_column | 0.63 |
+| count_visible | 0.31 |
+| count_hidden | 0.18 |
+| count_total | 0.17 |
+
+Spatial relations are read off almost perfectly while counting collapses, especially where it
+requires inferring cubes that cannot be seen. That is the decomposition's point: perception
+is close to solved, and what sits on top of it is not.
+
+**A harness bug produced a fake result first.** With a 16-token reply limit, the models that
+reason before answering returned empty text and were scored wrong on every item: Opus 5 came
+out at 0.00 and Opus 5.5 at 0.03, "worse" than Haiku, which answers in four tokens. Raising
+the limit and extracting the answer from a longer reply (last number, or last of the item's
+options) moved them to 0.49 and 0.59. Validate the harness before believing the leaderboard.
+
+**The IRT fit here is a pipeline check, not a measurement.** Four models is far below the
+usual floor (~15-30), and it shows: fitted discriminations sit on the prior (all a ~ 1.0) and
+difficulty is a monotone transform of accuracy (corr(b, 1 - accuracy) = 0.999), so IRT adds
+nothing over raw accuracy at this sample size. Item parameters need many more models.
+
 ## Known limitations
 
 - **The scheduler is a single process.** It is recoverable (it rebuilds from the Postgres
