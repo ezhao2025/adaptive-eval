@@ -63,24 +63,43 @@ def generate(rng: np.random.Generator, nx: int = 3, ny: int = 3, max_h: int = 3,
             return Scene(h.astype(int))
 
 
-def mark_two(scene: Scene, pixels: dict, rng: np.random.Generator,
-             min_frac: float = 0.5) -> Scene:
-    """Colour two clearly visible cubes (red, blue) so relation questions are answerable.
+MARK_COLOURS = ("red", "blue", "green")
+
+
+def mark_n(scene: Scene, pixels: dict, rng: np.random.Generator, n: int = 2,
+           min_frac: float = 0.5, hard: bool = False) -> Scene:
+    """Colour n clearly visible cubes so relation questions are answerable.
+
     A cube showing only a sliver is excluded: the question should test spatial reasoning,
-    not whether the model can spot 20 pixels of colour."""
+    not whether the model can spot 20 pixels of colour. With hard=True, prefer cubes that sit
+    close together on screen -- far-apart pairs made left/right trivial (every model scored
+    1.00), while near-neighbours force an actual comparison."""
     if not pixels:
         return scene
     cutoff = min_frac * max(pixels.values())
-    vis = sorted(c for c, n in pixels.items() if n >= cutoff)
-    if len(vis) < 2:
+    vis = sorted(c for c, v in pixels.items() if v >= cutoff)
+    if len(vis) < n:
         return scene
-    # pick two that differ on at least one axis
-    for _ in range(50):
-        a, b = (vis[i] for i in rng.choice(len(vis), 2, replace=False))
-        if a != b:
-            scene.marks = {"red": tuple(map(int, a)), "blue": tuple(map(int, b))}
-            break
+    best = None
+    for _ in range(60):
+        pick = [vis[i] for i in rng.choice(len(vis), n, replace=False)]
+        if n > 2 and not all(len({f(c) for c in pick}) == n for f in
+                             (lambda c: c[0] - c[1], lambda c: c[2], lambda c: c[0] + c[1])):
+            continue     # three-way questions need a unique winner on every dimension
+        if len({(c[0] - c[1], c[2]) for c in pick}) < n:      # need distinguishable positions
+            continue
+        spread = max(abs(a[0] - a[1] - (b[0] - b[1])) + abs(a[2] - b[2])
+                     for a in pick for b in pick)
+        if best is None or (spread < best[0]) == hard:
+            best = (spread, pick)
+    if best:
+        scene.marks = {MARK_COLOURS[i]: tuple(map(int, c)) for i, c in enumerate(best[1])}
     return scene
+
+
+def mark_two(scene: Scene, pixels: dict, rng: np.random.Generator,
+             min_frac: float = 0.5) -> Scene:
+    return mark_n(scene, pixels, rng, 2, min_frac)
 
 
 # ---- questions ---------------------------------------------------------------------
@@ -143,4 +162,53 @@ def relation_questions(scene: Scene) -> list[dict]:
                     "question": ("In the image, two cubes are coloured. Which one is nearer to "
                                  "you, the viewer? Answer 'red' or 'blue'."),
                     "answer": "red" if r_near > b_near else "blue", "options": ["red", "blue"]})
+    return out
+
+
+def support_questions(scene: Scene, visible: set) -> list[dict]:
+    """Mid-difficulty items: they need the structure, not just the surface. The pilot had a
+    gap between relations (b about -1.5) and counting (b about +1) with nothing in between."""
+    out = [{"subtask": "count_ground",
+            "question": ("The image shows a structure built from identical cubes stacked on a "
+                         "ground plane. How many cubes are touching the ground?"),
+            **_number(scene.footprint())}]
+    if "red" in scene.marks:
+        rx, ry, rz = scene.marks["red"]
+        out.append({"subtask": "support_on_ground",
+                    "question": ("In the image, one cube is coloured red. Is the red cube "
+                                 "resting directly on the ground? Answer 'yes' or 'no'."),
+                    "answer": "yes" if rz == 0 else "no", "options": ["yes", "no"]})
+        above = int(scene.heights[rx, ry]) - rz - 1
+        out.append({"subtask": "count_above_red",
+                    "question": ("In the image, one cube is coloured red. How many cubes are "
+                                 "stacked directly on top of it, in the same column?"),
+                    **_number(above)})
+    return out
+
+
+def triple_questions(scene: Scene) -> list[dict]:
+    """Three-way comparisons: chance is 1/3 instead of 1/2, and the model has to order three
+    things rather than compare two. The two-cube versions were at ceiling."""
+    if "green" not in scene.marks:
+        return []
+    m = scene.marks
+    names = list(m)
+    side = {k: m[k][0] - m[k][1] for k in names}         # screen horizontal
+    near = {k: m[k][0] + m[k][1] for k in names}         # toward the viewer
+    high = {k: m[k][2] for k in names}
+    out = []
+    for subtask, values, text in [
+            ("triple_leftmost", {k: -v for k, v in side.items()},
+         "Which of the three coloured cubes is furthest to the left, as you see them?"),
+            ("triple_highest", high, "Which of the three coloured cubes is highest off the "
+                                     "ground?"),
+            ("triple_nearest", near, "Which of the three coloured cubes is nearest to you, "
+                                     "the viewer?")]:
+        best = max(values.values())
+        winners = [k for k in names if values[k] == best]
+        if len(winners) == 1:                            # skip ties: no single right answer
+            out.append({"subtask": subtask,
+                        "question": f"In the image, three cubes are coloured red, blue and "
+                                    f"green. {text} Answer 'red', 'blue' or 'green'.",
+                        "answer": winners[0], "options": list(MARK_COLOURS)})
     return out

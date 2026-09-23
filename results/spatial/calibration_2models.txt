@@ -1,0 +1,17 @@
+       subtask       | acc  | count 
+---------------------+------+-------
+ count_total         | 0.17 |    24
+ count_hidden        | 0.25 |    24
+ count_ground        | 0.25 |    24
+ count_visible       | 0.42 |    24
+ tallest_column      | 0.54 |    24
+ count_above_red     | 0.64 |    14
+ triple_highest      | 0.71 |    14
+ relation_near_far   | 0.79 |    14
+ triple_nearest      | 0.79 |    14
+ support_on_ground   | 0.86 |    14
+ relation_height     | 0.93 |    14
+ triple_leftmost     | 0.93 |    14
+ relation_left_right | 1.00 |    14
+(13 rows)
+

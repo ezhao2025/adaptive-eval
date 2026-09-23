@@ -28,7 +28,12 @@ def main() -> None:
     p.add_argument("--ny", type=int, default=3)
     p.add_argument("--max-h", type=int, default=3)
     p.add_argument("--fill", type=float, default=0.8)
-    p.add_argument("--kinds", default="count,relation")
+    p.add_argument("--kinds", default="count,relation,triple,support")
+    p.add_argument("--hidden-frac", default="",
+                   help="keep structures whose hidden fraction lands in this range, e.g. 0.3:0.6;"
+                        " an occlusion knob that keeps biting after grid size saturates")
+    p.add_argument("--easy-marks", action="store_true",
+                   help="pick far-apart marked cubes (the pilot's trivial relation items)")
     p.add_argument("--size", type=int, default=40, help="pixels per cube edge")
     p.add_argument("--models", default="claude-haiku-4-5-20251001",
                    help="comma-separated model ids to evaluate")
@@ -37,17 +42,18 @@ def main() -> None:
     a = p.parse_args()
 
     kinds = tuple(a.kinds.split(","))
+    hidden = tuple(float(x) for x in a.hidden_frac.split(":")) if a.hidden_frac else None
+    common = dict(size=a.size, kinds=kinds, hidden_frac=hidden, hard=not a.easy_marks)
     if a.tiers:
         items = {}
         for i, spec in enumerate(a.tiers.split(",")):
             n, fill = spec.split(":")
             n = int(n)
             items.update(build(a.scenes, a.seed + 1000 * i, nx=n, ny=n, max_h=n,
-                               fill=float(fill), size=a.size, kinds=kinds,
-                               prefix=f"{a.tag}t{n}"))
+                               fill=float(fill), prefix=f"{a.tag}t{n}", **common))
     else:
         items = build(a.scenes, a.seed, nx=a.nx, ny=a.ny, max_h=a.max_h, fill=a.fill,
-                      size=a.size, kinds=kinds, prefix=a.tag)
+                      prefix=a.tag, **common)
     ids, models = list(items), a.models.split(",")
     out = pathlib.Path(a.out_dir)
     out.mkdir(exist_ok=True)

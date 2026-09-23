@@ -8,8 +8,9 @@ from PIL import Image
 
 from adaptive_eval.spatial.items import build
 from adaptive_eval.spatial.render import render, visible_cubes, visible_pixels
-from adaptive_eval.spatial.scene import (Scene, counting_questions, generate, mark_two,
-                                         relation_questions)
+from adaptive_eval.spatial.scene import (Scene, counting_questions, generate, mark_n,
+                                         mark_two, relation_questions, support_questions,
+                                         triple_questions)
 
 
 def test_solid_block_hides_exactly_its_core():
@@ -111,3 +112,58 @@ def test_left_right_matches_what_is_on_screen():
         assert answers["relation_left_right"] == ("left" if red_x < blue_x else "right")
         checked += 1
     assert checked >= 5
+
+
+def _marked(seed=1, n=3, hard=True, nx=4):
+    rng = np.random.default_rng(seed)
+    s = generate(rng, nx, nx, nx, 0.9)
+    px = visible_pixels(s, 40)
+    return mark_n(s, px, rng, n, hard=hard), px
+
+
+def test_triple_questions_have_one_unambiguous_winner():
+    s, _ = _marked()
+    qs = triple_questions(s)
+    assert qs, "three marked cubes should yield three-way questions"
+    for q in qs:
+        assert q["answer"] in q["options"] == list(("red", "blue", "green"))
+    m = s.marks
+    answers = {q["subtask"]: q["answer"] for q in qs}
+    if "triple_highest" in answers:
+        assert answers["triple_highest"] == max(m, key=lambda k: m[k][2])
+    if "triple_leftmost" in answers:
+        assert answers["triple_leftmost"] == min(m, key=lambda k: m[k][0] - m[k][1])
+    if "triple_nearest" in answers:
+        assert answers["triple_nearest"] == max(m, key=lambda k: m[k][0] + m[k][1])
+
+
+def test_support_questions_match_the_structure():
+    s, px = _marked()
+    qs = {q["subtask"]: q["answer"] for q in support_questions(s, set(px))}
+    x, y, z = s.marks["red"]
+    assert int(qs["count_ground"]) == s.footprint()
+    assert qs["support_on_ground"] == ("yes" if z == 0 else "no")
+    assert int(qs["count_above_red"]) == int(s.heights[x, y]) - z - 1
+
+
+def test_hard_marks_sit_closer_together_than_easy_ones():
+    def spread(hard):
+        out = []
+        for seed in range(8):
+            s, _ = _marked(seed=seed, n=2, hard=hard)
+            if len(s.marks) < 2:
+                continue
+            a, b = s.marks.values()
+            out.append(abs((a[0] - a[1]) - (b[0] - b[1])) + abs(a[2] - b[2]))
+        return np.mean(out)
+    assert spread(hard=True) < spread(hard=False)
+
+
+def test_hidden_fraction_knob_moves_occlusion():
+    low = build(6, seed=0, nx=4, ny=4, max_h=4, fill=0.9, kinds=("count",),
+                hidden_frac=(0.0, 0.15))
+    high = build(6, seed=0, nx=4, ny=4, max_h=4, fill=0.9, kinds=("count",),
+                 hidden_frac=(0.35, 0.7))
+    def frac(items):
+        return np.mean([it["scene"]["hidden_frac"] for it in items.values()])
+    assert frac(low) < 0.2 < frac(high)
