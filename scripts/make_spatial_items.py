@@ -19,7 +19,10 @@ from adaptive_eval.spatial.items import build  # noqa: E402
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--scenes", type=int, default=8)
+    p.add_argument("--scenes", type=int, default=8, help="scenes per difficulty tier")
+    p.add_argument("--tiers", default="",
+                   help="difficulty tiers as size:fill pairs, e.g. 2:0.7,3:0.85,4:0.9,5:0.95;"
+                        " size sets nx, ny and max height. Empty = one tier from --nx/--ny/--max-h")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--nx", type=int, default=3)
     p.add_argument("--ny", type=int, default=3)
@@ -33,8 +36,18 @@ def main() -> None:
     p.add_argument("--tag", default="spatial")
     a = p.parse_args()
 
-    items = build(a.scenes, a.seed, nx=a.nx, ny=a.ny, max_h=a.max_h, fill=a.fill,
-                  size=a.size, kinds=tuple(a.kinds.split(",")), prefix=a.tag)
+    kinds = tuple(a.kinds.split(","))
+    if a.tiers:
+        items = {}
+        for i, spec in enumerate(a.tiers.split(",")):
+            n, fill = spec.split(":")
+            n = int(n)
+            items.update(build(a.scenes, a.seed + 1000 * i, nx=n, ny=n, max_h=n,
+                               fill=float(fill), size=a.size, kinds=kinds,
+                               prefix=f"{a.tag}t{n}"))
+    else:
+        items = build(a.scenes, a.seed, nx=a.nx, ny=a.ny, max_h=a.max_h, fill=a.fill,
+                      size=a.size, kinds=kinds, prefix=a.tag)
     ids, models = list(items), a.models.split(",")
     out = pathlib.Path(a.out_dir)
     out.mkdir(exist_ok=True)
@@ -50,7 +63,9 @@ def main() -> None:
     for it in items.values():
         by_kind[it["subtask"]] = by_kind.get(it["subtask"], 0) + 1
     mb = len(json.dumps(items)) / 1e6
-    print(f"{len(items)} items from {a.scenes} scenes ({mb:.1f} MB) -> {out}/{a.tag}_items.json")
+    n_tiers = len(a.tiers.split(",")) if a.tiers else 1
+    print(f"{len(items)} items from {a.scenes * n_tiers} scenes in {n_tiers} tier(s) "
+          f"({mb:.1f} MB) -> {out}/{a.tag}_items.json")
     for k, v in sorted(by_kind.items()):
         print(f"  {k:22s} {v}")
 

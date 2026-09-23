@@ -130,16 +130,17 @@ def relation_questions(scene: Scene) -> list[dict]:
                     "question": ("In the image, two cubes are coloured. Which one is higher "
                                  "off the ground, the red cube or the blue cube? Answer 'red' "
                                  "or 'blue'."),
-                    "answer": "red" if rz > bz else "blue"})
+                    "answer": "red" if rz > bz else "blue", "options": ["red", "blue"]})
     if r_side != b_side:
         out.append({"subtask": "relation_left_right",
                     "question": ("In the image, two cubes are coloured. Is the red cube to the "
                                  "left or to the right of the blue cube, as you see them? "
                                  "Answer 'left' or 'right'."),
-                    "answer": "left" if r_side < b_side else "right"})
+                    "answer": "left" if r_side < b_side else "right",
+                    "options": ["left", "right"]})
     if r_near != b_near:
         out.append({"subtask": "relation_near_far",
                     "question": ("In the image, two cubes are coloured. Which one is nearer to "
                                  "you, the viewer? Answer 'red' or 'blue'."),
-                    "answer": "red" if r_near > b_near else "blue"})
+                    "answer": "red" if r_near > b_near else "blue", "options": ["red", "blue"]})
     return out

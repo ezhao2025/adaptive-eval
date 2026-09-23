@@ -35,6 +35,7 @@ def build(n: int, seed: int = 0, *, nx: int = 3, ny: int = 3, max_h: int = 3,
             iid = f"{prefix}-{i:04d}-{q['subtask']}"
             items[iid] = {"question": q["question"], "answer": q["answer"],
                           **({"aliases": q["aliases"]} if q.get("aliases") else {}),
+                          **({"options": q["options"]} if q.get("options") else {}),
                           "image_b64": image, "media_type": "image/png",
                           "subtask": q["subtask"], "scene": meta}
     return items

@@ -5,8 +5,8 @@ import anthropic
 import httpx
 import pytest
 
-from adaptive_eval.real_provider import (ANTHROPIC_CONFIG, AnthropicProvider, grade,
-                                         item_hashes, normalize)
+from adaptive_eval.real_provider import (ANTHROPIC_CONFIG, AnthropicProvider, extract,
+                                         grade, item_hashes, normalize)
 from adaptive_eval.providers import TransientError
 
 ITEMS = {"i1": {"question": "Capital of France?", "answer": "Paris"},
@@ -107,3 +107,23 @@ def test_unsupported_sampling_params_are_dropped():
     p._supported = {"model", "max_tokens", "messages"}     # as detected from a real SDK
     r = asyncio.run(p.answer("m", "i1"))
     assert r.correct and "temperature" not in p.client.messages.seen[0]
+
+
+@pytest.mark.parametrize("text,item,want", [
+    # a model that reasons out loud still gets credit for its final answer
+    ("Visible: 8. Hidden: 4. So the total is 12.", {"answer": "12"}, True),
+    ("I count four cubes.", {"answer": "4", "aliases": ["four"]}, True),
+    ("Hmm, 5 at first, but actually 6.", {"answer": "6"}, True),     # last number wins
+    ("Hmm, 5 at first, but actually 6.", {"answer": "5"}, False),
+    ("The blue one looks higher, so: red", {"answer": "red", "options": ["red", "blue"]}, True),
+    ("Red is lower, therefore blue", {"answer": "red", "options": ["red", "blue"]}, False),
+    ("", {"answer": "3"}, False),                                   # truncated reply
+    ("I cannot tell from this image.", {"answer": "3"}, False),
+])
+def test_answers_are_extracted_from_long_replies(text, item, want):
+    assert grade(text, item) is want
+
+
+def test_extract_returns_none_when_nothing_matches():
+    assert extract("no idea", {"answer": "7"}) is None
+    assert extract("purple", {"answer": "red", "options": ["red", "blue"]}) is None

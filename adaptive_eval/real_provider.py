@@ -20,6 +20,8 @@ import re
 import string
 import sys
 
+from .spatial.scene import NUMBER_WORDS
+
 from .providers import ProviderConfig, Response, TransientError
 
 # Conservative defaults; override from your Console's rate limits and pricing page.
@@ -45,17 +47,46 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower().translate(_PUNCT)).strip()
 
 
+def _tokens(text: str) -> list[str]:
+    return normalize(text).split()
+
+
+def extract(text: str, item: dict) -> str | None:
+    """Pull the answer out of a reply that may include reasoning or a full sentence.
+
+    Models that think before answering do not produce a bare word, so requiring the whole
+    reply to match would mark correct answers wrong. Rule: if the expected answer is a
+    number, take the LAST number in the reply; otherwise take the LAST of the item's options
+    that appears (the final answer, not one mentioned while reasoning)."""
+    toks = _tokens(text)
+    if not toks:
+        return None
+    expected = str(item["answer"])
+    if expected.isdigit():
+        nums = [t for t in toks if t.isdigit() or t in NUMBER_WORDS]
+        if not nums:
+            return None
+        last = nums[-1]
+        return str(NUMBER_WORDS.index(last)) if last in NUMBER_WORDS else last
+    options = [normalize(o) for o in item.get("options") or
+               [item["answer"], *item.get("aliases", [])]]
+    hits = [t for t in toks if t in options]
+    return hits[-1] if hits else None
+
+
 def grade(text: str, item: dict) -> bool:
-    """Exact match after normalization, against the answer or any listed alias."""
-    got = normalize(text)
-    return any(got == normalize(a) for a in [item["answer"], *item.get("aliases", [])])
+    got = extract(text, item)
+    if got is None:
+        return False
+    return any(got == normalize(a) or got == str(a)
+               for a in [item["answer"], *item.get("aliases", [])])
 
 
 class AnthropicProvider:
     """client is injectable so tests can exercise retries without touching the network."""
 
     def __init__(self, cfg: ProviderConfig, items: dict[str, dict], *, client=None,
-                 max_tokens: int = 16, name: str = "anthropic",
+                 max_tokens: int = 1500, name: str = "anthropic",
                  sampling: dict | None = None):
         self.name, self.cfg, self.items, self.max_tokens = name, cfg, items, max_tokens
         self.sampling = {"temperature": 0} if sampling is None else dict(sampling)

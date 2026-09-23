@@ -262,7 +262,8 @@ def main() -> None:
     p.add_argument("--tpm", type=float, default=ANTHROPIC_CONFIG.tpm)
     p.add_argument("--usd-per-1k-input", type=float, default=ANTHROPIC_CONFIG.usd_per_1k_input)
     p.add_argument("--usd-per-1k-output", type=float, default=ANTHROPIC_CONFIG.usd_per_1k_output)
-    p.add_argument("--max-tokens", type=int, default=16)
+    p.add_argument("--max-tokens", type=int, default=1500,
+                   help="models that think before answering need room; 16 truncates them")
     p.add_argument("--prefix", default="")
     p.add_argument("--schema", default=None)
     p.add_argument("--pg-dsn", default=os.environ.get("PG_DSN"))
