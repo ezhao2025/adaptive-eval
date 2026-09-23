@@ -291,6 +291,16 @@ out at 0.00 and Opus 5.5 at 0.03, "worse" than Haiku, which answers in four toke
 the limit and extracting the answer from a longer reply (last number, or last of the item's
 options) moved them to 0.49 and 0.59. Validate the harness before believing the leaderboard.
 
+**Difficulty saturates with size.** Mean accuracy by tier (base grid and stack height 2
+through 5): 0.81, 0.48, 0.42, 0.40. Almost the whole drop happens between tier 2 and tier 3;
+tier 5 structures hold roughly five times the cubes of tier 3 and are barely harder. Once
+counting collapses, adding cubes stops adding difficulty, so extending the scale upward needs
+a different knob (occlusion depth, ambiguity) rather than a bigger grid.
+
+**Item difficulty spans 3.2 logits** across sub-tasks, from b = -1.89 (left/right) to
+b = +1.35 (total count), from the same rendered scenes -- the perception/inference gap,
+measured rather than asserted.
+
 **The IRT fit here is a pipeline check, not a measurement.** Four models is far below the
 usual floor (~15-30), and it shows: fitted discriminations sit on the prior (all a ~ 1.0) and
 difficulty is a monotone transform of accuracy (corr(b, 1 - accuracy) = 0.999), so IRT adds
