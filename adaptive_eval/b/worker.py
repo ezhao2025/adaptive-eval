@@ -26,12 +26,13 @@ import signal
 import sys
 import time
 import zlib
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import numpy as np
 from redis.exceptions import ResponseError
 
 from .. import data as D
+from ..real_provider import ANTHROPIC_CONFIG, AnthropicProvider, load_items
 from ..providers import DEFAULT_PROVIDERS, ReplayProvider, TransientError
 from . import pgstore
 from .queue import Delivery, JobQueue, connect
@@ -214,8 +215,19 @@ def replay_providers(data_path: str, seed: int, cfgs: dict | None = None) -> dic
 async def amain(a) -> None:
     r = connect(a.redis_url)
     pool = await pgstore.connect(a.pg_dsn, a.schema)
-    cfgs = provider_configs(a.rate_scale, a.latency_scale)
-    w = Worker(a.id, r, pool, replay_providers(a.data, zlib.crc32(a.id.encode()), cfgs),
+    if a.provider == "anthropic":                 # real API: one provider, real limits/prices
+        cfgs = {"anthropic": replace(ANTHROPIC_CONFIG, rpm=a.rpm, tpm=a.tpm,
+                                     usd_per_1k_input=a.usd_per_1k_input,
+                                     usd_per_1k_output=a.usd_per_1k_output)}
+        providers = {"anthropic": AnthropicProvider(cfgs["anthropic"], load_items(a.items),
+                                                    max_tokens=a.max_tokens)}
+        print(f"[{a.id}] real provider: {cfgs['anthropic'].rpm} rpm, "
+              f"${cfgs['anthropic'].usd_per_1k_input}/1k in, "
+              f"${cfgs['anthropic'].usd_per_1k_output}/1k out", file=sys.stderr)
+    else:
+        cfgs = provider_configs(a.rate_scale, a.latency_scale)
+        providers = replay_providers(a.data, zlib.crc32(a.id.encode()), cfgs)
+    w = Worker(a.id, r, pool, providers,
                cfgs, prefix=a.prefix, concurrency=a.concurrency,
                min_idle_ms=a.min_idle_ms, inflight_ttl_s=a.inflight_ttl_s,
                spec_min_free=a.spec_min_free)
@@ -243,6 +255,14 @@ def main() -> None:
     p.add_argument("--spec-min-free", type=float, default=0.3,
                    help="drop a speculative job unless this fraction of the bucket is free")
     add_args(p)
+    p.add_argument("--provider", choices=["replay", "anthropic"], default="replay")
+    p.add_argument("--items", default="data/items_smoke.json",
+                   help="question/answer file for --provider anthropic")
+    p.add_argument("--rpm", type=float, default=ANTHROPIC_CONFIG.rpm)
+    p.add_argument("--tpm", type=float, default=ANTHROPIC_CONFIG.tpm)
+    p.add_argument("--usd-per-1k-input", type=float, default=ANTHROPIC_CONFIG.usd_per_1k_input)
+    p.add_argument("--usd-per-1k-output", type=float, default=ANTHROPIC_CONFIG.usd_per_1k_output)
+    p.add_argument("--max-tokens", type=int, default=16)
     p.add_argument("--prefix", default="")
     p.add_argument("--schema", default=None)
     p.add_argument("--pg-dsn", default=os.environ.get("PG_DSN"))

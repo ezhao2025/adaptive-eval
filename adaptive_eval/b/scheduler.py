@@ -30,6 +30,7 @@ from .. import data as D
 from ..engine import SessionConfig
 from ..irt import ItemBank, estimate_ability, fisher_information, select_next
 from ..providers import DEFAULT_PROVIDERS
+from ..real_provider import item_hashes, load_items
 from ..report import full_reference
 from ..storage import ResponseCache, SessionState
 from . import pgstore
@@ -72,11 +73,13 @@ class Scheduler:
     def __init__(self, run_name: str, models: list[str], model_provider: dict[str, str],
                  bank: ItemBank, pool, q: JobQueue, cfg: SessionConfig, *,
                  available: dict[str, set[int]] | None = None, consumer: str = "sched",
-                 admission: Admission | None = None, status_every_s: float = 5.0, log=print):
+                 admission: Admission | None = None, item_hash: dict[str, str] | None = None,
+                 status_every_s: float = 5.0, log=print):
         self.run_name, self.models, self.model_provider = run_name, list(models), model_provider
         self.bank, self.idx, self.pool, self.q, self.cfg = bank, bank.index(), pool, q, cfg
         self.store = pgstore.PgEventStore(pool)
         self.available, self.consumer, self.admission = available, consumer, admission
+        self.item_hash = item_hash or {}          # item content hash -> part of the cache key
         self.status_every_s, self.log = status_every_s, log
         self.sessions: dict[str, Session] = {}
         self.stats = dict(results=0, stale_results=0, reenqueued=0, failed=0, budget_stopped=0,
@@ -110,8 +113,11 @@ class Scheduler:
                                               session_id, n, allowed)]
 
     def cache_key(self, model: str, item_id: str) -> str:
+        """Everything that can change the answer is in the key, including the item's own
+        content: editing a question or its image must not reuse the old cached answer."""
         return ResponseCache.make_key(model=model, item=item_id, prompt=self.cfg.prompt_version,
-                                      decoding=self.cfg.decoding, sample=self.cfg.sample_idx)
+                                      decoding=self.cfg.decoding, sample=self.cfg.sample_idx,
+                                      item_hash=self.item_hash.get(item_id))
 
     def expected_cost(self, provider: str) -> float:
         """Mean measured cost of this provider's paid calls; config estimate until one lands."""
@@ -354,8 +360,10 @@ async def amain(a) -> None:
     admission = None if a.admission == "none" else Admission(
         q, cfgs, mode=a.admission, window_scale=a.window_scale,
         budget_usd=a.budget_usd)
+    hashes = item_hashes(load_items(a.items)) if a.items else None
     sched = Scheduler(a.run_name, models, d["model_provider"], bank, pool, q, cfg,
-                      available=available_items(d, bank), admission=admission)
+                      available=available_items(d, bank), admission=admission,
+                      item_hash=hashes)
     if a.speculate:
         sched.speculator = Speculator(sched, limiters_for(r, cfgs, prefix=a.prefix),
                                       pgstore.PgResponseCache(pool), min_free=a.spec_min_free,
@@ -405,6 +413,8 @@ def main() -> None:
                    help="stop admitting paid calls once this much is spent or committed")
     p.add_argument("--window-scale", type=float, default=1.5)
     add_args(p)
+    p.add_argument("--items", default=None,
+                   help="question/answer file; its content hashes go into the cache key")
     p.add_argument("--speculate", action="store_true",
                    help="prefetch both possible next items while a call is in flight")
     p.add_argument("--spec-max-fraction", type=float, default=0.2,
