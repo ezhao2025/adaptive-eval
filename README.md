@@ -306,6 +306,57 @@ usual floor (~15-30), and it shows: fitted discriminations sit on the prior (all
 difficulty is a monotone transform of accuracy (corr(b, 1 - accuracy) = 0.999), so IRT adds
 nothing over raw accuracy at this sample size. Item parameters need many more models.
 
+### Five models: weak models reveal which items discriminate
+
+A second item set (116 items, 3 tiers, an occlusion knob, and three-way comparisons) run
+against five models: two Claude models through the API and three open VLMs run locally on an
+8 GB M1 through MLX, behind the same Provider interface as the API models.
+
+| Model | Accuracy |
+|---|---:|
+| Claude Opus 5.5 | 0.63 |
+| Claude Haiku 4.5 | 0.51 |
+| Qwen2.5-VL 3B (4-bit) | 0.39 |
+| Qwen2-VL 2B (4-bit) | 0.33 |
+| SmolVLM 2B (4-bit) | 0.31 |
+
+Item difficulty spans 3.2 logits, and the ordering is the same decomposition the pilot found:
+
+| Sub-task | b | Accuracy |
+|---|---:|---:|
+| relation_left_right | -1.97 | 0.91 |
+| support_on_ground | -1.18 | 0.74 |
+| relation_height | -1.08 | 0.71 |
+| triple_leftmost | -1.01 | 0.69 |
+| relation_near_far | -0.79 | 0.63 |
+| triple_nearest | -0.77 | 0.63 |
+| triple_highest | -0.37 | 0.54 |
+| count_above_red | +0.32 | 0.34 |
+| tallest_column | +0.42 | 0.33 |
+| count_visible | +0.64 | 0.28 |
+| count_hidden | +1.12 | 0.18 |
+| count_ground | +1.15 | 0.18 |
+| count_total | +1.21 | 0.17 |
+
+**Adding a weak model changed which items looked useful.** On Claude models alone,
+`relation_height` (0.93) and `triple_highest` (0.71) looked like ceiling items worth cutting.
+Qwen2.5-VL 3B scores 0.29 and 0.14 on them, so they are among the most discriminating items
+in the bank: they separate weak models from strong ones, which is exactly what an item is
+for. Two families really are dead: `relation_left_right` is at or near 1.00 for every model,
+and `count_ground` is flat at about 0.2 across the whole ability range.
+
+**Local models are cheap but uneven.** Per item: Qwen2-VL 2B about 1.5 s, Qwen2.5-VL 3B about
+3 s, SmolVLM 2B about 23 s (its image tiling, not generation: a smaller token budget did not
+help). 8 GB of unified memory caps the local set at about 3B, so the locally runnable models
+all sit in a narrow 0.31-0.39 band.
+
+**IRT still needs more models than this.** At four models and again at five, fitted
+discriminations stay pinned to the prior (a in 0.89-1.10) and difficulty remains a monotone
+transform of accuracy (corr(b, 1 - accuracy) = 0.997). The "~15-30 models" floor is a real
+requirement, not a conservative hedge: every result reported here is an accuracy result, and
+the IRT fit is a pipeline check. Filling the middle of the ability range needs 7B-34B open
+VLMs, which need a rented GPU rather than an 8 GB laptop.
+
 ## Known limitations
 
 - **The scheduler is a single process.** It is recoverable (it rebuilds from the Postgres
