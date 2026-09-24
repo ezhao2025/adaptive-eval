@@ -1,0 +1,13 @@
+# Open VLMs with vLLM support, roughly weakest to strongest.
+# Start with the first three: if those work, the rest of the sweep usually does too.
+llava-hf/llava-1.5-7b-hf
+Qwen/Qwen2-VL-7B-Instruct
+Qwen/Qwen2.5-VL-7B-Instruct
+llava-hf/llava-onevision-qwen2-7b-ov-hf
+OpenGVLab/InternVL2_5-8B
+microsoft/Phi-3.5-vision-instruct
+HuggingFaceM4/Idefics3-8B-Llama3
+openbmb/MiniCPM-V-2_6
+mistral-community/pixtral-12b
+Qwen/Qwen2.5-VL-32B-Instruct-AWQ
+OpenGVLab/InternVL2_5-26B
