@@ -36,7 +36,9 @@ def main() -> None:
                    help="pick far-apart marked cubes (the pilot's trivial relation items)")
     p.add_argument("--size", type=int, default=40, help="pixels per cube edge")
     p.add_argument("--models", default="claude-haiku-4-5-20251001",
-                   help="comma-separated model ids to evaluate")
+                   help="comma-separated API model ids to evaluate")
+    p.add_argument("--local-models", default="",
+                   help="comma-separated MLX model ids (served by --provider mlx workers)")
     p.add_argument("--out-dir", default="data")
     p.add_argument("--tag", default="spatial")
     a = p.parse_args()
@@ -54,13 +56,17 @@ def main() -> None:
     else:
         items = build(a.scenes, a.seed, nx=a.nx, ny=a.ny, max_h=a.max_h, fill=a.fill,
                       prefix=a.tag, **common)
-    ids, models = list(items), a.models.split(",")
+    ids = list(items)
+    api = [m for m in a.models.split(",") if m]
+    local = [m for m in a.local_models.split(",") if m]
+    models = api + local
+    provider = {**{m: "anthropic" for m in api}, **{m: "mlx" for m in local}}
     out = pathlib.Path(a.out_dir)
     out.mkdir(exist_ok=True)
     (out / f"{a.tag}_items.json").write_text(json.dumps(items))
     (out / f"{a.tag}_data.json").write_text(json.dumps({
         "models": models, "items": ids, "R": [[1] * len(ids) for _ in models],
-        "model_provider": {m: "anthropic" for m in models}}))
+        "model_provider": provider}))
     (out / f"{a.tag}_params.json").write_text(json.dumps({
         "item_ids": ids, "a": [1.0] * len(ids),
         "b": [0.0] * len(ids),                 # flat: real parameters need many models first

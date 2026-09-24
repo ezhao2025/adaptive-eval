@@ -351,7 +351,15 @@ class Scheduler:
 async def amain(a) -> None:
     d = D.load(a.data)
     bank, meta = ItemBank.load(a.params)
-    models = meta["test_models"] if a.models == "test" else d["models"]
+    if a.models == "test":
+        models = meta["test_models"]
+    elif a.models == "all":
+        models = d["models"]
+    else:                                          # comma-separated names: run these only
+        models = [m.strip() for m in a.models.split(",")]
+        unknown = [m for m in models if m not in d["models"]]
+        if unknown:
+            sys.exit(f"not in the data file: {unknown}")
     cfg = SessionConfig(selector=a.selector, se_target=a.se_target, max_items=a.max_items)
     r = connect(a.redis_url)
     pool = await pgstore.connect(a.pg_dsn, a.schema)
@@ -406,7 +414,8 @@ def main() -> None:
     p.add_argument("--selector", default="max_info")
     p.add_argument("--se-target", type=float, default=0.30)
     p.add_argument("--max-items", type=int, default=100)
-    p.add_argument("--models", default="test", help="'test' (held-out models) or 'all'")
+    p.add_argument("--models", default="test",
+                   help="'test', 'all', or a comma-separated list of model names")
     p.add_argument("--admission", choices=["priority", "nearest", "fifo", "none"],
                    default="priority")
     p.add_argument("--budget-usd", type=float, default=None,

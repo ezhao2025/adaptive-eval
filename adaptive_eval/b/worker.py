@@ -32,6 +32,7 @@ import numpy as np
 from redis.exceptions import ResponseError
 
 from .. import data as D
+from ..mlx_provider import MLX_CONFIG, MLXProvider
 from ..real_provider import ANTHROPIC_CONFIG, AnthropicProvider, load_items
 from ..providers import DEFAULT_PROVIDERS, ReplayProvider, TransientError
 from . import pgstore
@@ -215,7 +216,13 @@ def replay_providers(data_path: str, seed: int, cfgs: dict | None = None) -> dic
 async def amain(a) -> None:
     r = connect(a.redis_url)
     pool = await pgstore.connect(a.pg_dsn, a.schema)
-    if a.provider == "anthropic":                 # real API: one provider, real limits/prices
+    if a.provider == "mlx":                       # local model: one per worker process
+        cfgs = {"mlx": MLX_CONFIG}
+        providers = {"mlx": MLXProvider(MLX_CONFIG, load_items(a.items), a.mlx_model,
+                                        max_tokens=min(a.max_tokens, 512))}
+        a.concurrency = 1                         # weights are shared; serialise on the GPU
+        print(f"[{a.id}] local model {a.mlx_model} (loads on first call)", file=sys.stderr)
+    elif a.provider == "anthropic":                 # real API: one provider, real limits/prices
         cfgs = {"anthropic": replace(ANTHROPIC_CONFIG, rpm=a.rpm, tpm=a.tpm,
                                      usd_per_1k_input=a.usd_per_1k_input,
                                      usd_per_1k_output=a.usd_per_1k_output)}
@@ -255,7 +262,9 @@ def main() -> None:
     p.add_argument("--spec-min-free", type=float, default=0.3,
                    help="drop a speculative job unless this fraction of the bucket is free")
     add_args(p)
-    p.add_argument("--provider", choices=["replay", "anthropic"], default="replay")
+    p.add_argument("--provider", choices=["replay", "anthropic", "mlx"], default="replay")
+    p.add_argument("--mlx-model", default="mlx-community/Qwen2.5-VL-3B-Instruct-4bit",
+                   help="Hugging Face id of an MLX vision model (downloaded on first use)")
     p.add_argument("--items", default="data/items_smoke.json",
                    help="question/answer file for --provider anthropic")
     p.add_argument("--rpm", type=float, default=ANTHROPIC_CONFIG.rpm)
