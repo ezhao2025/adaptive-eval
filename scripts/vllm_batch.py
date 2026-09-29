@@ -29,16 +29,48 @@ def prompt_of(item: dict) -> str:
 
 
 def run_model(model_id: str, items: dict, ids: list[str], out, max_tokens: int,
-              max_model_len: int, gpu_frac: float) -> None:
-    from PIL import Image
+              max_model_len: int, gpu_frac: float, legacy_prompt: bool = False) -> None:
     from vllm import LLM, SamplingParams
 
     t0 = time.time()
     llm = LLM(model=model_id, max_model_len=max_model_len, gpu_memory_utilization=gpu_frac,
               limit_mm_per_prompt={"image": 1}, trust_remote_code=True)
-    tok = llm.get_tokenizer()
     params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
 
+    if legacy_prompt:
+        outputs = llm.generate(_legacy_requests(llm, items, ids), params)
+    else:
+        # llm.chat applies the model's own chat template, including templates that live in
+        # the processor rather than the tokenizer (LLaVA-OneVision, LLaVA-1.5, ...). Building
+        # the prompt from the tokenizer alone silently fell back to a bare prompt for those
+        # models, and they answered with an immediate end-of-turn: empty text.
+        convs = []
+        for iid in ids:
+            item = items[iid]
+            url = f"data:{item.get('media_type', 'image/png')};base64,{item['image_b64']}"
+            convs.append([{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": url}},
+                {"type": "text", "text": prompt_of(item)}]}])
+        outputs = llm.chat(convs, params)
+
+    empty = 0
+    for iid, o in zip(ids, outputs):
+        text = o.outputs[0].text
+        empty += not text.strip()
+        out.write(json.dumps({"model": model_id, "item_id": iid, "text": text,
+                              "output_tokens": len(o.outputs[0].token_ids)}) + "\n")
+    out.flush()
+    print(f"[{model_id}] {len(ids)} items in {time.time() - t0:.0f}s, {empty} empty replies",
+          flush=True)
+    if empty > len(ids) // 2:
+        print(f"[{model_id}] WARNING: most replies are empty -- check the prompt format",
+              flush=True)
+
+
+def _legacy_requests(llm, items: dict, ids: list[str]) -> list[dict]:
+    """The original prompt path (tokenizer chat template), kept to reproduce earlier runs."""
+    from PIL import Image
+    tok = llm.get_tokenizer()
     requests = []
     for iid in ids:
         item = items[iid]
@@ -50,14 +82,7 @@ def run_model(model_id: str, items: dict, ids: list[str], out, max_tokens: int,
         except Exception:
             text = f"<image>\n{prompt_of(item)}"
         requests.append({"prompt": text, "multi_modal_data": {"image": image}})
-
-    outputs = llm.generate(requests, params)
-    for iid, o in zip(ids, outputs):
-        out.write(json.dumps({"model": model_id, "item_id": iid,
-                              "text": o.outputs[0].text,
-                              "output_tokens": len(o.outputs[0].token_ids)}) + "\n")
-    out.flush()
-    print(f"[{model_id}] {len(ids)} items in {time.time() - t0:.0f}s", flush=True)
+    return requests
 
 
 def main() -> None:
@@ -70,6 +95,8 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--gpu-frac", type=float, default=0.90)
+    p.add_argument("--legacy-prompt", action="store_true",
+                   help="build prompts from the tokenizer's chat template (the original path)")
     a = p.parse_args()
 
     models = [m.strip() for m in a.models.split(",") if m.strip()]
@@ -86,7 +113,8 @@ def main() -> None:
     with open(a.out, "a") as out:                  # append: a crashed model does not lose the rest
         for model_id in models:
             try:
-                run_model(model_id, items, ids, out, a.max_tokens, a.max_model_len, a.gpu_frac)
+                run_model(model_id, items, ids, out, a.max_tokens, a.max_model_len, a.gpu_frac,
+                          a.legacy_prompt)
             except Exception as e:                 # one unsupported model must not end the sweep
                 print(f"[{model_id}] FAILED: {type(e).__name__}: {e}", flush=True)
 
