@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from explanatory_cv import fit, load                                  # noqa: E402
 
-from adaptive_eval.c.ranking import Bank2D, choose, score, variance_after  # noqa: E402
+from adaptive_eval.c.ranking import Bank2D, choose, content_mask, score, variance_after  # noqa: E402
 
 
 def make_bank(D, calib_cols, pool_cols):
@@ -41,24 +41,29 @@ def make_bank(D, calib_cols, pool_cols):
                   r["b"][pool_cols], D["dim_of_subtask"][s])
 
 
-def run(method, bank, Y, w, budgets, rng=None):
+def run(method, bank, Y, w, budgets, rng=None, groups=None):
+    """method: random | independent | coupled | coupled-1step, optionally '+cb'
+    (content balancing over `groups`, the items' subtasks)."""
+    cb = method.endswith("+cb")
+    method = method[:-3] if cb else method
     n_m, n_i = Y.shape
     ans = [dict() for _ in range(n_m)]
     st = [score(bank, w, a) for a in ans]
     vn = [variance_after(bank, w, a, s) for a, s in zip(ans, st)]
     out, calls = {}, 0
     while calls < max(budgets):
+        view = [content_mask(groups, w, a, v) for a, v in zip(ans, vn)] if cb else vn
         if method == "coupled":
-            m, i, _ = choose(st, vn)
+            m, i, _ = choose(st, view)
         elif method == "coupled-1step":
-            m, i, _ = choose(st, vn, lookahead=(1,))
+            m, i, _ = choose(st, view, lookahead=(1,))
         else:
             m = calls % n_m
-            free = np.where(np.isfinite(vn[m]))[0]
+            free = np.where(np.isfinite(view[m]))[0]
             if free.size == 0:
                 calls += 1
                 continue
-            i = int(rng.choice(free)) if method == "random" else int(free[np.argmin(vn[m][free])])
+            i = int(rng.choice(free)) if method == "random" else int(free[np.argmin(view[m][free])])
         ans[m][i] = int(Y[m, i])
         st[m] = score(bank, w, ans[m])
         vn[m] = variance_after(bank, w, ans[m], st[m])
@@ -85,7 +90,8 @@ def main():
     scenes = np.unique(D["scene"])
     per_model = [5, 10, 20, 40, 80]
     budgets = [k * n_m for k in per_model]
-    res = {m: {b: [] for b in budgets} for m in ("random", "independent", "coupled-1step", "coupled")}
+    res = {m: {b: [] for b in budgets} for m in ("random", "independent", "coupled-1step", "coupled", "independent+cb",
+                                                   "coupled+cb")}
     alloc = {b: [] for b in budgets}
 
     for sp in range(a.splits):
@@ -101,7 +107,8 @@ def main():
         for method in res:
             draws = a.random_draws if method == "random" else 1
             for dr in range(draws):
-                out = run(method, bank, Y, w, budgets, np.random.default_rng(1000 * sp + dr))
+                out = run(method, bank, Y, w, budgets, np.random.default_rng(1000 * sp + dr),
+                          D["s_idx"][pool])
                 for b, (est, n_ans) in out.items():
                     tau = kendalltau(est, truth).statistic
                     res[method][b].append((tau, round((1 - tau) * pairs / 2)))
@@ -121,12 +128,16 @@ def main():
             row.append(f"{t.mean():8.3f} {t.std():5.3f} {wr.mean():6.1f}")
         print(f"{k:>11d} | " + " | ".join(row))
 
-    print("\npaired by split, coupled minus independent: mean tau diff, splits won/tied/lost")
-    for k, b in zip(per_model, budgets):
-        d = np.array([x[0] for x in res["coupled"][b]]) - \
-            np.array([x[0] for x in res["independent"][b]])
-        print(f"  {k:3d} calls/model: {d.mean():+.3f}  {(d > 1e-9).sum()}/{(abs(d) <= 1e-9).sum()}"
-              f"/{(d < -1e-9).sum()}")
+    for x, y in (("coupled", "independent"), ("coupled+cb", "independent"),
+                 ("coupled+cb", "random"), ("independent+cb", "independent")):
+        print(f"\npaired by split, {x} minus {y}: mean tau diff, splits won/tied/lost")
+        for k, b in zip(per_model, budgets):
+            ya = np.array([t[0] for t in res[y][b]])
+            if y == "random":                     # several draws per split: average them
+                ya = ya.reshape(a.splits, -1).mean(1)
+            d = np.array([t[0] for t in res[x][b]]) - ya
+            print(f"  {k:3d} calls/model: {d.mean():+.3f}  {(d > 1e-9).sum()}/"
+                  f"{(abs(d) <= 1e-9).sum()}/{(d < -1e-9).sum()}")
 
     print("\ncoupled: calls per model at the largest budget (mean over splits)")
     A = np.array(alloc[budgets[-1]]).mean(0)

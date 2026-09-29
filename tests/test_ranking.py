@@ -107,3 +107,41 @@ def test_lookahead_keeps_gain_alive_when_one_answer_cannot_flip_a_pair(bank):
     one = choose(states, v_new, lookahead=(1,))[2]
     kg = choose(states, v_new)[2]
     assert kg > 1e6 * max(one, 1e-300) and kg > 1e-7
+
+
+def test_indifference_zone_matches_brute_force_and_ignores_near_ties(bank):
+    from adaptive_eval.c.ranking import ModelState, pool_score_sd
+    w = bank.weights()
+    rng = np.random.default_rng(5)
+    for trial in range(10):
+        ans = [answers(bank, rng.normal(0, 1, 2), rng.choice(60, rng.integers(0, 40), replace=False),
+                       seed=trial * 10 + k) for k in range(4)]
+        states = [score(bank, w, a) for a in ans]
+        vn = [variance_after(bank, w, a, s) for a, s in zip(ans, states)]
+        fm, fi, fg = choose(states, vn, lookahead=(1,), delta=0.02)
+        bm, bi, bg = choose_full(states, vn, delta=0.02)
+        assert np.isclose(fg, bg, rtol=1e-9, atol=1e-15)
+    # a near-tie (gap 0.002) is worth pursuing at delta=0 and worth ~nothing at delta=0.05
+    th, cov = np.zeros(2), np.eye(2)
+    tie = [ModelState(0.500, 0.01 ** 2, th, cov), ModelState(0.502, 0.01 ** 2, th, cov)]
+    vn = [np.full(len(bank), 0.009 ** 2)] * 2
+    assert choose(tie, vn)[2] > 1e2 * max(choose(tie, vn, delta=0.05)[2], 1e-300)
+    assert expected_discordant(tie, delta=0.05) < 1e-3 < expected_discordant(tie)
+    assert 0 < pool_score_sd(bank, w, 0.3, 0.8) < 0.1
+
+
+def test_content_mask_follows_score_weight_shares(bank):
+    from adaptive_eval.c.ranking import content_mask
+    w = bank.weights()
+    groups = np.arange(len(bank)) % 3              # 3 groups; group 0 = the relations items
+    ans = {}
+    picks = []
+    for _ in range(30):
+        st = score(bank, w, ans)
+        vn = content_mask(groups, w, ans, variance_after(bank, w, ans, st))
+        i = int(np.argmin(vn))
+        picks.append(groups[i])
+        ans[i] = 1
+    share = np.array([w[groups == g].sum() for g in range(3)])
+    got = np.bincount(picks, minlength=3) / 30
+    assert np.abs(got - share).max() < 0.05       # picks track each group's score weight

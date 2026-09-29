@@ -149,32 +149,40 @@ def variance_after(bank: Bank2D, w: np.ndarray, answered: dict[int, int],
     return v_new
 
 
-def discord(d: np.ndarray, var: np.ndarray) -> np.ndarray:
-    """P(the pair is ordered wrongly) given estimated gap d and its variance."""
-    return norm.cdf(-np.abs(d) / np.sqrt(var))
+def discord(d: np.ndarray, var: np.ndarray, delta: float = 0.0) -> np.ndarray:
+    """P(the pair is ordered wrongly by more than delta), given estimated gap d and its
+    variance. With the true gap ~ N(d, var) and d > 0, that is P(true gap < -delta).
+
+    delta = 0 is plain misorder probability. delta > 0 is an indifference zone: swapping
+    two models whose true gap is under delta costs nothing, so the allocator stops paying
+    to separate near-ties it could only resolve by luck. Tested on sp6 placement with
+    delta = the pool score's sampling sd (~0.02): no measurable change (c_placement.txt).
+    """
+    return norm.cdf(-(np.abs(d) + delta) / np.sqrt(var))
 
 
-def expected_discordant(states: list[ModelState]) -> float:
+def expected_discordant(states: list[ModelState], delta: float = 0.0) -> float:
     s = np.array([x.s for x in states])
     v = np.array([x.v for x in states])
     j, k = np.triu_indices(len(states), 1)
-    return float(discord(s[j] - s[k], v[j] + v[k]).sum())
+    return float(discord(s[j] - s[k], v[j] + v[k], delta).sum())
 
 
-def gains(m: int, states: list[ModelState], v_new: np.ndarray) -> np.ndarray:
+def gains(m: int, states: list[ModelState], v_new: np.ndarray,
+          delta: float = 0.0) -> np.ndarray:
     """Expected drop in discordant pairs from asking model m each item (preposterior)."""
     me = states[m]
     others = [k for k in range(len(states)) if k != m]
     d = np.array([me.s - states[k].s for k in others])            # (K,)
     vk = np.array([states[k].v for k in others])                  # (K,)
-    now = discord(d, me.v + vk).sum()
+    now = discord(d, me.v + vk, delta).sum()
     fin = np.isfinite(v_new)
     vn = np.minimum(v_new[fin], me.v)                             # (n',)
     tau = np.sqrt(np.maximum(me.v - vn, 0.0))                     # sd of the mean's move
-    # d' = d + tau Z ;  E Phi(-|d'| / sqrt(vn + vk))
+    # d' = d + tau Z ;  E Phi(-(|d'| + delta) / sqrt(vn + vk))
     dd = d[None, :, None] + tau[:, None, None] * _GH_X[None, None, :]
     sd = np.sqrt(vn[:, None, None] + vk[None, :, None])
-    after = (norm.cdf(-np.abs(dd) / sd) * _GH_W).sum(-1).sum(-1)  # (n',)
+    after = (norm.cdf(-(np.abs(dd) + delta) / sd) * _GH_W).sum(-1).sum(-1)  # (n',)
     out = np.full(len(v_new), -np.inf)
     out[fin] = now - after
     return out
@@ -185,7 +193,8 @@ LOOKAHEAD = (1, 2, 4, 8, 16, 32, 64)
 
 def choose(states: list[ModelState], banks_v_new: list[np.ndarray],
            cost: np.ndarray | None = None,
-           lookahead: tuple[int, ...] = LOOKAHEAD) -> tuple[int, int, float]:
+           lookahead: tuple[int, ...] = LOOKAHEAD,
+           delta: float = 0.0) -> tuple[int, int, float]:
     """Coupled allocation: the (model, item) with the largest gain per unit cost.
 
     Which item: a model's gain depends on the item only through v_new and falls as v_new
@@ -213,7 +222,7 @@ def choose(states: list[ModelState], banks_v_new: list[np.ndarray],
         rr = r[r <= n_left]
         dinfo = max(1 / v_new[i] - 1 / v, 0.0)
         v_r = 1 / (1 / v + rr * dinfo)
-        g = float((gains(m, states, v_r) / rr).max())
+        g = float((gains(m, states, v_r, delta) / rr).max())
         if cost is not None:
             g = g / cost[m]
         if g > best[2]:
@@ -222,11 +231,11 @@ def choose(states: list[ModelState], banks_v_new: list[np.ndarray],
 
 
 def choose_full(states: list[ModelState], banks_v_new: list[np.ndarray],
-                cost: np.ndarray | None = None) -> tuple[int, int, float]:
+                cost: np.ndarray | None = None, delta: float = 0.0) -> tuple[int, int, float]:
     """Brute force over every (model, item); same answer as choose(), much slower."""
     best = (-1, -1, -np.inf)
     for m, v_new in enumerate(banks_v_new):
-        g = gains(m, states, v_new)
+        g = gains(m, states, v_new, delta)
         if cost is not None:
             g = g / cost[m]
         i = int(np.argmax(g))
@@ -234,3 +243,45 @@ def choose_full(states: list[ModelState], banks_v_new: list[np.ndarray],
             best = (m, i, float(g[i]))
     return best
 
+
+
+def pool_score_sd(bank: Bank2D, w: np.ndarray, p_count: float, p_rel: float) -> float:
+    """Sampling sd of a fully observed pool score at accuracies p_count and p_rel:
+    what the score would move if the same model answered a fresh draw of equally many
+    items. A natural indifference zone: gaps smaller than this are not resolvable by the
+    benchmark itself, however many calls are spent."""
+    c = bank.dim == 0
+    return float(np.sqrt((w[c] ** 2).sum() * p_count * (1 - p_count)
+                         + (w[~c] ** 2).sum() * p_rel * (1 - p_rel)))
+
+
+def content_mask(groups: np.ndarray, w: np.ndarray, answered: dict[int, int],
+                 v_new: np.ndarray) -> np.ndarray:
+    """Content balancing: v_new with every item outside the most under-sampled group set
+    to inf, so the next pick comes from that group.
+
+    Target share of a group = its share of the score weight w. The group with the largest
+    deficit (target share x (n + 1) - answers so far) among groups that still have an
+    askable item is allowed; ties go to the lowest group id. Without this, variance-
+    minimizing selection draws almost every early call from the one or two most
+    discriminating subtasks, and a model's score then rests on how it does there.
+
+    Tested and NOT adopted (results/c_ranking_real.txt, c_placement.txt): on sp6 it forces
+    early calls onto the large low-discrimination counting subtasks, which cut ranking
+    tau from 0.61 to 0.05 at 5 calls per model and never beat plain selection by a
+    margin that survived the no-calls baseline. Kept to reproduce that result.
+    """
+    g_ids = np.unique(groups)
+    share = np.array([w[groups == g].sum() for g in g_ids]) / w.sum()
+    count = np.zeros(len(g_ids))
+    pos = {g: k for k, g in enumerate(g_ids)}
+    for i in answered:
+        count[pos[groups[i]]] += 1
+    open_ = np.array([np.isfinite(v_new[groups == g]).any() for g in g_ids])
+    if not open_.any():
+        return v_new
+    deficit = np.where(open_, share * (len(answered) + 1) - count, -np.inf)
+    g = g_ids[int(np.argmax(deficit))]
+    out = v_new.copy()
+    out[groups != g] = np.inf
+    return out
