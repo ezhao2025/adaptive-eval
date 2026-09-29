@@ -13,8 +13,8 @@ they differ only in which (model, item) they ask next:
   independent  round-robin over models, the item that most shrinks that model's own
                score variance (Design A/B behaviour: each session minds itself)
   coupled      the (model, item) with the largest expected drop in discordant pairs
-  coupled+warmup  independent for the first 3 calls per model, then coupled
-                  (with no answers every model looks tied, so early coupled picks are noise)
+  coupled-1step   coupled with a one-step lookahead (the first version). Its gains hit 0
+                  once no single answer can flip a pair, so later picks were tie-breaks
 """
 from __future__ import annotations
 
@@ -41,15 +41,17 @@ def make_bank(D, calib_cols, pool_cols):
                   r["b"][pool_cols], D["dim_of_subtask"][s])
 
 
-def run(method, bank, Y, w, budgets, rng=None, warmup=3):
+def run(method, bank, Y, w, budgets, rng=None):
     n_m, n_i = Y.shape
     ans = [dict() for _ in range(n_m)]
     st = [score(bank, w, a) for a in ans]
     vn = [variance_after(bank, w, a, s) for a, s in zip(ans, st)]
     out, calls = {}, 0
     while calls < max(budgets):
-        if method == "coupled" or (method == "coupled+warmup" and calls >= warmup * n_m):
+        if method == "coupled":
             m, i, _ = choose(st, vn)
+        elif method == "coupled-1step":
+            m, i, _ = choose(st, vn, lookahead=(1,))
         else:
             m = calls % n_m
             free = np.where(np.isfinite(vn[m]))[0]
@@ -83,7 +85,7 @@ def main():
     scenes = np.unique(D["scene"])
     per_model = [5, 10, 20, 40, 80]
     budgets = [k * n_m for k in per_model]
-    res = {m: {b: [] for b in budgets} for m in ("random", "independent", "coupled", "coupled+warmup")}
+    res = {m: {b: [] for b in budgets} for m in ("random", "independent", "coupled-1step", "coupled")}
     alloc = {b: [] for b in budgets}
 
     for sp in range(a.splits):
@@ -119,9 +121,9 @@ def main():
             row.append(f"{t.mean():8.3f} {t.std():5.3f} {wr.mean():6.1f}")
         print(f"{k:>11d} | " + " | ".join(row))
 
-    print("\npaired by split, coupled+warmup minus independent: mean tau diff, splits won/tied/lost")
+    print("\npaired by split, coupled minus independent: mean tau diff, splits won/tied/lost")
     for k, b in zip(per_model, budgets):
-        d = np.array([x[0] for x in res["coupled+warmup"][b]]) - \
+        d = np.array([x[0] for x in res["coupled"][b]]) - \
             np.array([x[0] for x in res["independent"][b]])
         print(f"  {k:3d} calls/model: {d.mean():+.3f}  {(d > 1e-9).sum()}/{(abs(d) <= 1e-9).sum()}"
               f"/{(d < -1e-9).sum()}")

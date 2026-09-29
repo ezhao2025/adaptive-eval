@@ -164,12 +164,50 @@ def gains(m: int, states: list[ModelState], v_new: np.ndarray) -> np.ndarray:
     return out
 
 
+LOOKAHEAD = (1, 2, 4, 8, 16, 32, 64)
+
+
 def choose(states: list[ModelState], banks_v_new: list[np.ndarray],
-           cost: np.ndarray | None = None) -> tuple[int, int, float]:
+           cost: np.ndarray | None = None,
+           lookahead: tuple[int, ...] = LOOKAHEAD) -> tuple[int, int, float]:
     """Coupled allocation: the (model, item) with the largest gain per unit cost.
 
-    Returns (model, item, gain). Deterministic: ties go to the lowest model, then item.
+    Which item: a model's gain depends on the item only through v_new and falls as v_new
+    falls, so each model's best item is its argmin v_new. Coupling decides *which model*.
+    That makes this O(models^2) instead of O(models^2 x items).
+
+    Which model (KG*): one answer moves a score by ~1/sqrt(n) of its range, so once the
+    gap in a pair is several times that, a one-step lookahead sees no chance of a flip and
+    scores the pair ~0, even when it is still 20% likely to be misordered. Every model
+    then ties at 0 and allocation degenerates to the tie-break. So score each model by
+    max_r gain(r answers) / r, approximating r answers as r times this item's information:
+        1 / v_r = 1 / v + r * (1 / v_new - 1 / v).
+    lookahead=(1,) is the plain one-step rule; choose_full() is its brute-force oracle.
+
+    Returns (model, item, gain per call). Deterministic: ties go to the lowest model/item.
     """
+    best = (-1, -1, -np.inf)
+    r = np.asarray(lookahead, float)
+    for m, v_new in enumerate(banks_v_new):
+        i = int(np.argmin(v_new))
+        if not np.isfinite(v_new[i]):
+            continue                                      # nothing left to ask this model
+        v = states[m].v
+        n_left = int(np.isfinite(v_new).sum())
+        rr = r[r <= n_left]
+        dinfo = max(1 / v_new[i] - 1 / v, 0.0)
+        v_r = 1 / (1 / v + rr * dinfo)
+        g = float((gains(m, states, v_r) / rr).max())
+        if cost is not None:
+            g = g / cost[m]
+        if g > best[2]:
+            best = (m, i, g)
+    return best
+
+
+def choose_full(states: list[ModelState], banks_v_new: list[np.ndarray],
+                cost: np.ndarray | None = None) -> tuple[int, int, float]:
+    """Brute force over every (model, item); same answer as choose(), much slower."""
     best = (-1, -1, -np.inf)
     for m, v_new in enumerate(banks_v_new):
         g = gains(m, states, v_new)
@@ -179,3 +217,4 @@ def choose(states: list[ModelState], banks_v_new: list[np.ndarray],
         if g[i] > best[2]:
             best = (m, i, float(g[i]))
     return best
+

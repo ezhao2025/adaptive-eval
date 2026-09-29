@@ -1,0 +1,30 @@
+split 0: 345 pool items; truth claude-opus-5-5(0.694) > Qwen2.5-VL-32B-Instruct-AWQ(0.597) > claude-haiku-4-5-20251001(0.564) > Qwen2-VL-7B-Instruct(0.557) > Qwen2.5-VL-7B-Instruct(0.538) > Qwen2.5-VL-3B-Instruct-4bit(0.468) > Qwen2-VL-2B-Instruct-4bit(0.326)
+split 1: 393 pool items; truth claude-opus-5-5(0.668) > Qwen2.5-VL-32B-Instruct-AWQ(0.599) > claude-haiku-4-5-20251001(0.565) > Qwen2-VL-7B-Instruct(0.564) > Qwen2.5-VL-7B-Instruct(0.542) > Qwen2.5-VL-3B-Instruct-4bit(0.466) > Qwen2-VL-2B-Instruct-4bit(0.338)
+split 2: 361 pool items; truth claude-opus-5-5(0.695) > Qwen2.5-VL-32B-Instruct-AWQ(0.614) > claude-haiku-4-5-20251001(0.582) > Qwen2-VL-7B-Instruct(0.542) > Qwen2.5-VL-7B-Instruct(0.515) > Qwen2.5-VL-3B-Instruct-4bit(0.453) > Qwen2-VL-2B-Instruct-4bit(0.340)
+split 3: 369 pool items; truth claude-opus-5-5(0.676) > Qwen2.5-VL-32B-Instruct-AWQ(0.613) > Qwen2-VL-7B-Instruct(0.575) > claude-haiku-4-5-20251001(0.556) > Qwen2.5-VL-7B-Instruct(0.541) > Qwen2.5-VL-3B-Instruct-4bit(0.462) > Qwen2-VL-2B-Instruct-4bit(0.320)
+split 4: 345 pool items; truth claude-opus-5-5(0.709) > Qwen2.5-VL-32B-Instruct-AWQ(0.610) > Qwen2.5-VL-7B-Instruct(0.580) > Qwen2-VL-7B-Instruct(0.565) > claude-haiku-4-5-20251001(0.557) > Qwen2.5-VL-3B-Instruct-4bit(0.479) > Qwen2-VL-2B-Instruct-4bit(0.370)
+
+Kendall tau vs true pool accuracy (w_count=0.5), 7 models, 21 pairs; mean over 5 splits (random: x5 draws)
+calls/model |                 random |            independent |          coupled-1step |                coupled
+            |      tau    sd  wrong |      tau    sd  wrong |      tau    sd  wrong |      tau    sd  wrong
+          5 |    0.265 0.218    7.7 |    0.613 0.077    4.2 |    0.524 0.120    5.0 |    0.524 0.120    5.0
+         10 |    0.421 0.210    6.1 |    0.579 0.116    4.2 |    0.638 0.164    3.8 |    0.638 0.164    3.8
+         20 |    0.524 0.230    5.0 |    0.765 0.108    2.4 |    0.822 0.118    1.8 |    0.829 0.111    1.8
+         40 |    0.691 0.158    3.2 |    0.790 0.111    2.2 |    0.867 0.143    1.4 |    0.867 0.143    1.4
+         80 |    0.787 0.135    2.2 |    0.886 0.038    1.2 |    0.924 0.071    0.8 |    0.962 0.047    0.4
+
+paired by split, coupled minus independent: mean tau diff, splits won/tied/lost
+    5 calls/model: -0.089  2/0/3
+   10 calls/model: +0.059  2/1/2
+   20 calls/model: +0.064  2/2/1
+   40 calls/model: +0.076  3/1/1
+   80 calls/model: +0.076  4/1/0
+
+coupled: calls per model at the largest budget (mean over splits)
+  Qwen2-VL-7B-Instruct                137.4
+  Qwen2.5-VL-32B-Instruct-AWQ          45.4
+  Qwen2.5-VL-7B-Instruct              110.4
+  claude-haiku-4-5-20251001           132.0
+  claude-opus-5-5                      22.8
+  Qwen2-VL-2B-Instruct-4bit            27.2
+  Qwen2.5-VL-3B-Instruct-4bit          84.8

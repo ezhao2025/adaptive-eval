@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from scipy.special import expit
 
-from adaptive_eval.c.ranking import (Bank2D, choose, discord, expected_discordant, gains,
+from adaptive_eval.c.ranking import (Bank2D, choose, choose_full, discord, expected_discordant, gains,
                                      posterior, score, variance_after)
 
 
@@ -82,3 +82,28 @@ def test_choose_prefers_the_uncertain_close_pair(bank):
 
 def test_expected_discordant_bounds():
     assert np.isclose(discord(np.array([0.0]), np.array([1.0]))[0], 0.5)
+
+
+def test_fast_choose_matches_brute_force(bank):
+    w = bank.weights()
+    rng = np.random.default_rng(3)
+    for trial in range(15):
+        ans = [answers(bank, rng.normal(0, 1, 2), rng.choice(60, rng.integers(0, 40), replace=False),
+                       seed=trial * 10 + k) for k in range(5)]
+        states = [score(bank, w, a) for a in ans]
+        vn = [variance_after(bank, w, a, s) for a, s in zip(ans, states)]
+        fm, fi, fg = choose(states, vn, lookahead=(1,))
+        bm, bi, bg = choose_full(states, vn)
+        assert np.isclose(fg, bg, rtol=1e-9, atol=1e-15)
+        assert (fm, fi) == (bm, bi) or np.isclose(fg, bg, rtol=1e-12, atol=1e-18)
+
+
+def test_lookahead_keeps_gain_alive_when_one_answer_cannot_flip_a_pair(bank):
+    """Two nearly-resolved models ~2 sd apart: one answer can't flip them, 32 can."""
+    from adaptive_eval.c.ranking import ModelState
+    th, cov = np.zeros(2), np.eye(2)
+    states = [ModelState(0.50, 0.01 ** 2, th, cov), ModelState(0.52, 0.01 ** 2, th, cov)]
+    v_new = [np.full(len(bank), 0.0099 ** 2), np.full(len(bank), 0.0099 ** 2)]
+    one = choose(states, v_new, lookahead=(1,))[2]
+    kg = choose(states, v_new)[2]
+    assert kg > 1e6 * max(one, 1e-300) and kg > 1e-7
