@@ -231,6 +231,14 @@ async def amain(a) -> None:
         print(f"[{a.id}] real provider: {cfgs['anthropic'].rpm} rpm, "
               f"${cfgs['anthropic'].usd_per_1k_input}/1k in, "
               f"${cfgs['anthropic'].usd_per_1k_output}/1k out", file=sys.stderr)
+    elif a.provider == "vllm":                    # a model behind `vllm serve` (HTTP)
+        from ..vllm_provider import VLLM_CONFIG, VLLMProvider
+        if not a.base_url:
+            sys.exit("--provider vllm needs --base-url (the server's http(s) address)")
+        cfgs = {"vllm": VLLM_CONFIG}
+        providers = {"vllm": VLLMProvider(VLLM_CONFIG, load_items(a.items), a.base_url,
+                                          max_tokens=min(a.max_tokens, 64))}
+        print(f"[{a.id}] vLLM server at {a.base_url}", file=sys.stderr)
     else:
         cfgs = provider_configs(a.rate_scale, a.latency_scale)
         providers = replay_providers(a.data, zlib.crc32(a.id.encode()), cfgs)
@@ -262,7 +270,11 @@ def main() -> None:
     p.add_argument("--spec-min-free", type=float, default=0.3,
                    help="drop a speculative job unless this fraction of the bucket is free")
     add_args(p)
-    p.add_argument("--provider", choices=["replay", "anthropic", "mlx"], default="replay")
+    p.add_argument("--provider", choices=["replay", "anthropic", "mlx", "vllm"],
+                   default="replay")
+    p.add_argument("--base-url", default=os.environ.get("VLLM_BASE_URL"),
+                   help="--provider vllm: server address, e.g. https://<pod>-8000.proxy.runpod.net"
+                        " (API key from VLLM_API_KEY)")
     p.add_argument("--mlx-model", default="mlx-community/Qwen2.5-VL-3B-Instruct-4bit",
                    help="Hugging Face id of an MLX vision model (downloaded on first use)")
     p.add_argument("--items", default="data/items_smoke.json",

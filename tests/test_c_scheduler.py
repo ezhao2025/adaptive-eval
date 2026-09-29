@@ -187,3 +187,20 @@ def test_failed_model_drops_out_and_the_rest_are_ranked(world):
     ranked = {r["model"] for r in summary["ranking"]}
     assert bad not in ranked and ranked == set(world["models"][1:])
     assert summary["failed"] == 1
+
+
+def test_anchors_are_ranked_but_never_asked(world):
+    """Placing new models: known models' answers are preloaded, only new models get calls."""
+    anchors = {m: {it: int(world["Y"][i, j]) for j, it in enumerate(world["bank"].item_ids)}
+               for i, m in enumerate(world["models"][:5])}
+    live = dict(world, models=world["models"][5:])
+    summary, ev, orphans, _ = asyncio.run(run_c(live, anchors=anchors, max_calls=45,
+                                                windows={p: 2 for p in FAST},
+                                                stop_discordant=0.0))
+    assert summary["calls"] == 45 and orphans == 0
+    asked = {e["session_id"].split(":", 1)[1] for e in ev if e["type"] == "allocation"}
+    assert asked <= set(world["models"][5:])                     # anchors never asked
+    rows = {r["model"]: r for r in summary["ranking"]}
+    assert set(rows) == set(world["models"])                     # but all are ranked
+    assert all(rows[m]["anchor"] and rows[m]["calls"] == 0 for m in anchors)
+    assert sum(rows[m]["calls"] for m in world["models"][5:]) == 45

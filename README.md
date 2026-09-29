@@ -14,6 +14,30 @@ It is built in three stages: **A**, a single-process service; **B**, a distribut
 injection; and **C**, adaptive *ranking* of many models at once on a procedurally
 generated spatial-reasoning benchmark for vision-language models.
 
+## At a glance
+
+- **Fewer calls, better rankings (A).** On ARC-Challenge, 40 adaptively chosen items rank
+  held-out model checkpoints better than 160 random items, on both held-out families
+  (Kendall tau 0.79 vs 0.66 on Pythia-6.9B, 0.63 vs 0.56 on OLMo-2-7B).
+- **Crash-safe distributed evaluation (B).** Scheduler plus stateless workers over Redis
+  Streams and a Postgres event log. It matches the single-process design's ability
+  estimates to 9 decimals. Killing workers or the scheduler with `kill -9`, or wiping Redis
+  mid-run, still reproduced a clean run exactly; the worst case re-paid 1 call of 2,227.
+  Throughput scales 5.7x at 8 workers until the shared rate limit binds.
+- **Ranking many models at once (C).** An allocator that spends each call where it most
+  reduces expected misordered pairs. On real answers from 7 VLMs it reaches Kendall tau 0.96
+  at 80 calls per model vs 0.89 for per-model adaptive testing; on simulated 64-model
+  leaderboards it wins all 10 from 10 calls per model on.
+- **IRT with too few models.** 8 models cannot fit per-item parameters (held-out log-loss
+  0.676 on new items, near a constant's 0.687). Predicting difficulty from the item
+  generator's settings gets 0.469.
+- **Negative results are reported, not dropped.** An inflated-discrimination failure that
+  ranked checkpoints backwards (A); a lookahead flaw in the allocator; two fixes that did not
+  help; and a baseline showing that placing new models on a leaderboard needs about 40 calls
+  each before any method beats leaving them at the average score (C).
+- **Tested:** 95 tests, including exact-equivalence tests between designs and crash/replay
+  tests against real Postgres and Redis.
+
 ## Results on real data
 
 **Setup.** ARC-Challenge per-item results (1,172 items) for 452 pretraining checkpoints of six

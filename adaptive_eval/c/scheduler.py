@@ -67,6 +67,7 @@ class Lane:
     answered: dict[int, int] = field(default_factory=dict)   # bank index -> correct
     pending: tuple[int, int] | None = None                    # (step, bank index)
     failed: bool = False
+    anchor: bool = False                                      # known answers, never asked
     state: ModelState | None = None
     v_new: np.ndarray | None = None
 
@@ -81,8 +82,13 @@ class RankingScheduler:
                  min_relative_gain: float = 0.5,
                  prompt_version: str = "v1", decoding: str = "temp0", sample_idx: int = 0,
                  item_hash: dict[str, str] | None = None, consumer: str = "sched-c",
+                 anchors: dict[str, dict[str, int]] | None = None,
                  status_every_s: float = 5.0, log=print):
+        """anchors: models whose answers are already known (model -> item_id -> correct).
+        They are ranked alongside `models` but never asked: placing new models on an existing
+        leaderboard. They live only in memory (reloaded on restart), not in the event log."""
         self.run_name, self.models, self.model_provider = run_name, list(models), model_provider
+        self.anchors = anchors or {}
         self.bank, self.idx, self.pool, self.q = bank, bank.index(), pool, q
         self.w = bank.weights(w_count)
         self.w_count = w_count
@@ -139,7 +145,8 @@ class RankingScheduler:
         return expected_discordant([ln.state for ln in live]) if len(live) > 1 else 0.0
 
     def calls_made(self) -> int:
-        return sum(len(ln.answered) for ln in self.lanes.values()) + len(self._inflight())
+        return sum(len(ln.answered) for ln in self.lanes.values() if not ln.anchor) + \
+            len(self._inflight())
 
     # ---- allocation --------------------------------------------------------------
     async def _fill(self) -> None:
@@ -263,6 +270,14 @@ class RankingScheduler:
             self._refresh(ln)
             self.lanes[sid] = ln
             self.order.append(sid)
+        for m, answers in self.anchors.items():
+            sid = f"{self.run_name}:anchor:{m}"
+            ln = Lane(sid, m, "anchor", {self.idx[it]: int(c) for it, c in answers.items()
+                                         if it in self.idx}, anchor=True)
+            self._refresh(ln)
+            ln.v_new = np.full(len(self.bank), np.inf)          # never asked
+            self.lanes[sid] = ln
+            self.order.append(sid)
         self.seq = int(await self.pool.fetchval(
             "SELECT COUNT(*) FROM events e JOIN sessions s USING (session_id)"
             " WHERE s.run_name=$1 AND e.type='allocation'", self.run_name))
@@ -311,13 +326,14 @@ class RankingScheduler:
 
     async def _finish(self) -> None:
         for ln in self.lanes.values():
-            if not ln.failed:
+            if not ln.failed and not ln.anchor:
                 await self.store.finish(ln.session_id, ln.state.s, float(np.sqrt(ln.state.v)),
                                         len(ln.answered))
 
     def ranking(self) -> list[dict]:
         rows = [{"model": ln.model, "score": round(ln.state.s, 4),
-                 "sd": round(float(np.sqrt(ln.state.v)), 4), "calls": len(ln.answered)}
+                 "sd": round(float(np.sqrt(ln.state.v)), 4),
+                 "calls": 0 if ln.anchor else len(ln.answered), "anchor": ln.anchor}
                 for ln in self.lanes.values() if not ln.failed]
         return sorted(rows, key=lambda r: -r["score"])
 
@@ -336,23 +352,51 @@ def available_items(d: dict, bank: Bank2D) -> dict[str, set[int]]:
             for i, m in enumerate(d["models"])}
 
 
+def load_anchors(path: str) -> dict[str, dict[str, int]]:
+    """Fully answered models from a response matrix (scripts/spatial_matrix.py output)."""
+    d = json.load(open(path))
+    out = {}
+    for m, row in zip(d["models"], d["R"]):
+        if all(v is not None for v in row):
+            out[m] = {it: int(v) for it, v in zip(d["items"], row)}
+    return out
+
+
 async def amain(a) -> None:
-    d = D.load(a.data)
     bank, _ = Bank2D.load(a.bank)
-    models = d["models"] if a.models == "all" else [m.strip() for m in a.models.split(",")]
-    unknown = [m for m in models if m not in d["models"]]
-    if unknown:
-        sys.exit(f"not in the data file: {unknown}")
+    if a.live_models:                      # new models, asked live; anchors optional
+        models = [m.strip() for m in a.live_models.split(",") if m.strip()]
+        model_provider = {m: a.live_provider for m in models}
+        d = None
+    else:
+        if not a.data:
+            sys.exit("give --data (replay) or --live-models")
+        d = D.load(a.data)
+        models = d["models"] if a.models == "all" else [m.strip() for m in a.models.split(",")]
+        unknown = [m for m in models if m not in d["models"]]
+        if unknown:
+            sys.exit(f"not in the data file: {unknown}")
+        model_provider = d["model_provider"]
+    if a.live_provider == "vllm" and a.live_models:
+        from ..vllm_provider import VLLM_CONFIG
+        cfgs = {"vllm": VLLM_CONFIG}
+    else:
+        cfgs = provider_configs(a.rate_scale, a.latency_scale)
+    anchors = load_anchors(a.anchors) if a.anchors else None
+    if anchors:
+        anchors = {m: v for m, v in anchors.items() if m not in models}
+        print(f"[sched-c] {len(anchors)} anchors from {a.anchors}", file=sys.stderr)
     r = connect(a.redis_url)
     pool = await pgstore.connect(a.pg_dsn, a.schema)
-    cfgs = provider_configs(a.rate_scale, a.latency_scale)
-    q = JobQueue(r, sorted(set(d["model_provider"].values())), a.prefix)
+    q = JobQueue(r, sorted(set(model_provider.values())), a.prefix)
     sched = RankingScheduler(
-        a.run_name, models, d["model_provider"], bank, pool, q, cfgs, w_count=a.w_count,
-        available=available_items(d, bank) if a.replay else None,
+        a.run_name, models, model_provider, bank, pool, q, cfgs, w_count=a.w_count,
+        available=available_items(d, bank) if a.replay and d is not None else None,
         max_inflight=a.max_inflight, max_calls=a.max_calls, budget_usd=a.budget_usd,
         stop_discordant=a.stop_discordant, min_relative_gain=a.min_relative_gain,
-        item_hash=item_hashes(load_items(a.items)) if a.items else None)
+        cost_aware=not a.unit_cost, anchors=anchors,
+        item_hash=item_hashes(load_items(a.items)) if a.items else None,
+        log=lambda *x: print(*x, file=sys.stderr))     # stdout carries only the JSON summary
     try:
         if a.exit_after is not None:
             try:
@@ -376,8 +420,17 @@ def main() -> None:
     p = argparse.ArgumentParser(prog="adaptive_eval.c.scheduler")
     p.add_argument("--run-name", required=True)
     p.add_argument("--bank", required=True, help="Bank2D JSON (scripts/make_bank2d.py)")
-    p.add_argument("--data", required=True, help="models and model_provider (and, with"
+    p.add_argument("--data", default=None, help="models and model_provider (and, with"
                    " --replay, the logged answers workers replay)")
+    p.add_argument("--live-models", default="",
+                   help="comma-separated models to ask live (instead of --data)")
+    p.add_argument("--live-provider", default="vllm",
+                   help="provider (worker queue) the live models are served by")
+    p.add_argument("--anchors", default=None,
+                   help="response matrix whose fully answered models are ranked alongside,"
+                        " never asked (e.g. data/sp6_matrix.json)")
+    p.add_argument("--unit-cost", action="store_true",
+                   help="allocate by gain per call, not per dollar (e.g. an hourly-billed GPU)")
     p.add_argument("--models", default="all", help="'all' or a comma-separated list")
     p.add_argument("--replay", action="store_true",
                    help="only ask items that have a logged answer for that model")
