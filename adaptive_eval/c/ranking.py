@@ -22,6 +22,7 @@ speculation rely on (argmax ties break by lowest index).
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 import numpy as np
@@ -49,6 +50,21 @@ class Bank2D:
         L = np.zeros((len(self), self.n_dims))
         L[np.arange(len(self)), self.dim] = self.a
         return L                                        # logit = L @ theta - b
+
+    def index(self) -> dict[str, int]:
+        return {iid: i for i, iid in enumerate(self.item_ids)}
+
+    def save(self, path: str, extra: dict | None = None) -> None:
+        with open(path, "w") as f:
+            json.dump({"item_ids": self.item_ids, "a": self.a.tolist(), "b": self.b.tolist(),
+                       "dim": self.dim.tolist(), "n_dims": self.n_dims, **(extra or {})}, f)
+
+    @classmethod
+    def load(cls, path: str) -> tuple["Bank2D", dict]:
+        with open(path) as f:
+            d = json.load(f)
+        return cls(d["item_ids"], np.array(d["a"], float), np.array(d["b"], float),
+                   np.array(d["dim"], int), int(d.get("n_dims", 2))), d
 
     def weights(self, w_count: float = 0.5) -> np.ndarray:
         is_c = self.dim == 0

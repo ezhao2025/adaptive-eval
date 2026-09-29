@@ -1,0 +1,22 @@
+python scripts/c_concurrency_experiment.py   (sp6 big-v1, same 5 splits as ranking_experiment.py)
+
+7 models, 3 providers, windows = calls in flight per provider; mean over 5 splits
+calls/model window  rho max in flight    tau     sd  wall s
+         20    seq  0.0             1  0.829  0.111     7.7
+         20      1  0.0             3  0.714  0.135     2.6
+         20      1  0.5             3  0.829  0.111     4.5
+         20      2  0.0             6  0.733  0.126     1.5
+         20      2  0.5             6  0.810  0.135     2.3
+         20      4  0.0             7  0.766  0.138     1.4
+         20      4  0.5             7  0.714  0.200     1.3
+         80    seq  0.0             1  0.962  0.047    30.6
+         80      1  0.0             3  0.924  0.038    10.0
+         80      1  0.5             3  0.976  0.037    19.5
+         80      2  0.0             6  0.924  0.038     5.6
+         80      2  0.5             6  0.962  0.047    10.1
+         80      4  0.0             7  0.886  0.038     5.2
+         80      4  0.5             7  0.905  0.060     5.1
+
+seq = one call in flight in total; its tau equals the offline allocator's (ranking_experiment.py).
+rho = min_relative_gain (leave a slot idle if its best call < rho x the best call anywhere).
+One misordered pair of 21 = 0.095 tau, so differences under ~0.1 are about one pair.
