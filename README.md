@@ -9,6 +9,11 @@ The approach follows Fluid Benchmarking (Hofmann et al., COLM 2025), which appli
 adaptive item selection to LM evaluation. This repo reimplements the method as an async
 evaluation service and tests it on held-out model families.
 
+It is built in three stages: **A**, a single-process service; **B**, a distributed version
+(workers, Redis queues, Postgres event log) that reproduces A exactly under fault
+injection; and **C**, adaptive *ranking* of many models at once on a procedurally
+generated spatial-reasoning benchmark for vision-language models.
+
 ## Results on real data
 
 **Setup.** ARC-Challenge per-item results (1,172 items) for 452 pretraining checkpoints of six
@@ -151,7 +156,7 @@ diff <(python -m adaptive_eval.cli report --run-name demo --db data/crash.db) \
      <(python -m adaptive_eval.cli report --run-name demo --db data/clean.db)
 ```
 
-## Design B (in progress): distributed evaluation
+## Design B: distributed evaluation
 
 A scheduler process and a pool of stateless workers, coordinated through Redis Streams,
 with an atomic Redis rate limiter shared by all workers and Postgres as the source of truth.
@@ -240,14 +245,10 @@ calls this count misses.
 
 ### Door to Design C
 
-Design C ranks models adaptively, which couples sessions: spending a call on one model
-changes what is worth asking the others. B is built so that C changes as little as possible.
-The admission heap becomes C's global budget allocator, and only its priority function
-changes, from one session's SE reduction to the reduction in uncertainty about the ranking.
-Every admission decision is already logged as an `allocation` event, so C's coupled
-decisions can be audited and replayed. `irt.py` keeps a stable interface: a
-multidimensional theta changes what `estimate_ability`, `fisher_information`, and
-`select_next` return, not how they are called.
+B logs every admission decision as an `allocation` event so that Design C's coupled
+decisions could be audited and replayed; C uses exactly that. The rest of the plan written
+here (reuse the admission heap, extend `irt.py`) did not survive; see
+[How Design C departed from B's plan](#how-design-c-departed-from-bs-plan).
 
 ## Spatial benchmark (VLM items)
 
@@ -357,6 +358,222 @@ requirement, not a conservative hedge: every result reported here is an accuracy
 the IRT fit is a pipeline check. Filling the middle of the ability range needs 7B-34B open
 VLMs, which need a rented GPU rather than an 8 GB laptop.
 
+## Design C: adaptive ranking across models
+
+Designs A and B measure one model at a time. Design C ranks a set of models, which couples
+their evaluations: a call spent on one model is worth more when that model's neighbours on
+the leaderboard are close. The allocator spends each call on the (model, item) pair that most
+reduces the expected number of misordered pairs, and it runs on B's distributed stack.
+
+**Data.** 746 spatial items (13 sub-tasks, grid sizes 2-4, `data/big_items.json`) and 8
+models that answered them: three open VLMs run with vLLM on a rented GPU, two Claude models
+through the API, and three 4-bit models through MLX (SmolVLM answered only 103 items and is
+left out of the rankings). Five more open VLMs were run afterwards to test placing new models
+on the leaderboard (below); two others that were attempted failed to load (a tokenizer
+incompatibility with the current vLLM, and a gated repository).
+
+### Eight models is too few for per-item IRT, so item features stand in
+
+Every IRT fit on the spatial data so far sat on the prior: 8 models cannot pin down two
+parameters per item. But these items are generated, so their difficulty can be predicted
+from the generator's settings (sub-task, share of cubes hidden, cube count, grid size) plus
+a small, heavily regularized per-item residual: about 30 free parameters plus residuals
+held near zero, instead of ~1,500 free ones. Each sub-task
+loads on one of two abilities, fixed in advance: counting/occlusion or spatial relations.
+
+Held-out log-loss, 5-fold (a constant prediction scores 0.687):
+
+| Model | Held-out answers | Held-out scenes (new items) |
+|---|---:|---:|
+| 2PL, parameters per item (Design A's model) | 0.498 | 0.676 |
+| Difficulty per sub-task only | 0.511 | 0.514 |
+| Explanatory, 1 ability | 0.468 | 0.472 |
+| Explanatory, 1 ability + item residual | 0.454 | 0.472 |
+| Explanatory, 2 abilities (counting, relations) | 0.467 | 0.469 |
+| Explanatory, 2 abilities + item residual | **0.453** | **0.469** |
+
+Per-item 2PL is barely better than a constant on items it has not seen; the feature model
+predicts them almost as well as items it has. Two abilities beat one by a small but
+consistent margin (0.002, on all 5 extra seeds for both splits), and the two correlate at
+0.78.
+
+**Ranking target.** With two abilities, "rank the models" needs a weighting. The score is
+accuracy weighted 50/50 between the counting and relations families, so the 70% of items that
+are counting questions (each scene yields more of them) do not set the weight by accident.
+Sweeping the counting weight from 0 to 0.7 leaves the order of the seven fully answered
+models unchanged; it reshuffles only near 1.0, where a counting-only score drops
+Qwen2.5-VL-32B (weakest at counting in the middle of the pack, best at relations after Opus)
+below Claude Haiku and Qwen2.5-VL-7B.
+
+### Allocation: expected misordered pairs, with a multi-step lookahead
+
+Each model's score is estimated from its answers plus IRT predictions for items it has not
+answered, so the estimate equals the true score once every item is answered. The allocator
+asks the model whose next answer is expected to remove the most misordered pairs,
+averaging over how that answer could move the score (so an exact tie still shows a gain).
+
+**The first version could stall late in a run.** One answer moves a score by about 1/n, so
+once a pair's gap is a few times that, no single answer can flip it: a one-step lookahead
+scores the pair near zero even while it is still 20% likely to be misordered, and once every
+pair looks like that, allocation degrades to a tie-break. The fix scores each model by its
+best gain per call over the next 1, 2, 4, ..., 64 answers. The flaw matters mostly near the
+end: on real data the two rules agree at 5, 10 and 40 calls per model and differ at 80
+(tau 0.924 one-step, 0.962 with the fix). The range was not tuned: on 16 simulated models,
+extending it to 256 answers changes nothing, shortening it to 8 moves tau by at most 0.007,
+and even the one-step rule stays within 0.02 (`results/c_lookahead.txt`).
+
+### Ranking from scratch
+
+Real answers, 7 models, the item bank calibrated on half the scenes and the models ranked on
+the other half (5 random splits). Truth is each model's actual 50/50 accuracy on the ranking
+half. Kendall tau:
+
+| Calls per model | Random | Independent | Coupled |
+|---:|---:|---:|---:|
+| 5 | 0.27 | **0.61** | 0.52 |
+| 10 | 0.42 | 0.58 | **0.64** |
+| 20 | 0.52 | 0.77 | **0.83** |
+| 40 | 0.69 | 0.79 | **0.87** |
+| 80 | 0.79 | 0.89 | **0.96** |
+
+"Independent" is Design A/B behaviour: each model gets the same number of calls and asks the
+item that most shrinks its own score's variance. Coupled wins from 10 calls per model (by
+0.06-0.08 tau, winning or tying 3-5 of 5 splits), and at 80 calls it misorders 0.4 of 21
+pairs against 1.2. It does so by moving calls: at 80 calls per model, the two closest
+mid-table models (Claude Haiku and Qwen2-VL-7B) got about 135 calls each and the clear
+leader (Opus) 23. One misordered pair is
+0.095 tau here, so these are differences of about one pair.
+
+**At scale, simulated.** Leaderboards of 8-64 models drawn from the fitted population, with
+answers generated from the full fit and a deliberately imperfect bank (difficulties from item
+features only). Coupled minus independent, Kendall tau, 10 leaderboards per size:
+
+| Calls per model | 8 models | 16 | 32 | 64 |
+|---:|---:|---:|---:|---:|
+| 5 | -0.02 | +0.01 | +0.01 | -0.01 |
+| 10 | +0.10 | +0.08 | +0.03 | **+0.05** |
+| 20 | +0.14 | +0.08 | **+0.08** | **+0.10** |
+| 40 | +0.05 | **+0.08** | **+0.08** | **+0.12** |
+| 80 | +0.06 | **+0.11** | **+0.08** | **+0.08** |
+
+Bold: 95% interval excludes zero. The advantage grows more consistent as the leaderboard
+gets denser (64 models: 10 of 10 leaderboards won at every budget from 10 calls). Coupled
+never helps measurably at 5 calls per model, on real or simulated data: it needs a few
+answers per model before it can tell which pairs are close.
+
+### Placing new models on an existing leaderboard
+
+Five more open VLMs, run on all 746 items afterwards (their answers are the ground truth),
+placed against the 7 known models with the bank calibrated on the original models only.
+True leaderboard, new models starred:
+
+1. Claude Opus 5.5 0.692 · 2. Qwen2.5-VL-32B 0.600 · 3. ★ Pixtral-12B 0.569 · 4. Claude Haiku
+4.5 0.563 · 5. Qwen2-VL-7B 0.561 · 6. Qwen2.5-VL-7B 0.547 · 7. ★ LLaVA-OneVision-7B 0.526 ·
+8. ★ Idefics3-8B 0.518 · 9. ★ Phi-3.5-vision 0.471 · 10. Qwen2.5-VL-3B 0.457 · 11. ★
+LLaVA-1.5-7B 0.347 · 12. Qwen2-VL-2B 0.340
+
+Pairs involving a new model ordered correctly, out of 45 (20 repeats on random 80% subsets
+of scenes):
+
+| Calls per new model | Random | Independent | Coupled |
+|---:|---:|---:|---:|
+| 0 (every new model left at the average score) | 37.9 | 37.9 | 37.9 |
+| 5 | 34.9 | 32.8 | 34.0 |
+| 20 | 36.6 | 36.4 | 36.4 |
+| 40 | 38.5 | 39.8 | 40.2 |
+| 80 | 40.5 | **42.2** | 41.8 |
+
+**The zero-call row is the finding.** A new model left at the average score lands mid-table,
+and a mid-table guess already orders 38 of 45 pairs right on this leaderboard. No method
+beats that until about 40 calls per new model; after that, adaptive beats random by about
+1.5 pairs, and coupled ties independent. With the anchors' scores known exactly, coupling
+only decides which new model to ask next, and that choice matters less than which item to
+ask.
+
+**Two fixes were tested and not adopted.** Both are kept in the code, off by default, so the
+results reproduce:
+- *Indifference zone:* ignore pairs closer than the score's own sampling noise (about 0.02),
+  on the theory that coupled wasted calls separating near-ties (Pixtral got a third of all
+  calls). No change: within 0.4 pairs everywhere.
+- *Content balancing* (standard in adaptive testing): force each model's calls to follow the
+  sub-tasks' share of the score, since variance-minimizing selection took 43 of its first 50
+  calls from 2 of the 13 sub-tasks. It looked like a large win in placement at 5-10 calls,
+  but that was the zero-call effect: its early items barely move the estimates. Ranking from
+  scratch exposed it, dropping tau at 5 calls per model from 0.61 to 0.05.
+
+### Distributed scheduler
+
+`adaptive_eval/c/scheduler.py` runs the allocator on B's workers, Redis queues and Postgres
+event log unchanged. Each model has at most one call in flight (a second would be chosen as
+if the first had not happened), per-provider windows cap concurrency, and every decision is
+logged as an `allocation` event with a global sequence number and the gain it was made on.
+
+**Replay.** With one call in flight, the distributed run makes exactly the offline
+allocator's decisions, including across a scheduler crash, and on sp6 reproduces its tau
+(0.829 and 0.962 at 20 and 80 calls). With several in flight, the order results arrive in is
+not reproducible, so recovery rebuilds state from the log and the tests check invariants
+instead: no model with two calls out, no item asked twice, every answer preceded by a logged
+allocation, nothing orphaned, and final scores recomputable from the log alone. Deliberately
+breaking recovery, or allowing two calls per model, fails those tests.
+
+**Concurrency costs accuracy unless some slots stay empty.** Filling every free slot forces a
+call onto each provider's best model even when that call is nearly worthless. Leaving a slot
+idle when its best call is worth less than half the best call anywhere (set once, not tuned)
+recovers one-at-a-time quality. 7 models on 3 simulated providers:
+
+| Calls per model | Setup | Tau | Wall clock |
+|---:|---|---:|---:|
+| 20 | one call at a time | 0.83 | 7.7 s |
+| 20 | 1 per provider, fill every slot | 0.71 | 2.6 s |
+| 20 | 2 per provider, idle rule | 0.81 | 2.3 s |
+| 80 | one call at a time | 0.96 | 30.6 s |
+| 80 | 2 per provider, fill every slot | 0.92 | 5.6 s |
+| 80 | 2 per provider, idle rule | 0.96 | 10.1 s |
+| 80 | every model at once | 0.89-0.91 | 5 s |
+
+Useful parallelism is bounded by the number of models: with every model in flight, the
+allocator has nothing left to choose.
+
+### How Design C departed from B's plan
+
+B's plan was to reuse its admission heap with a new priority and to give `irt.py` a
+multidimensional theta behind the same interface. Neither survived contact. Priorities in a
+heap go stale the moment any answer lands, because every answer changes its neighbours'
+gains, so the C scheduler re-decides from current state on each result instead of queueing.
+And per-item IRT could not be fit at all on 8 models, so C uses a separate explanatory,
+two-ability bank (`adaptive_eval/c/ranking.py`) rather than extending `irt.py`.
+
+### Caveats
+
+- Real leaderboards here have 7-12 models; the evidence at 32-64 models is simulated from a
+  model fitted on those 12.
+- One benchmark (the spatial items), one item generator, and a 50/50 target chosen by hand.
+- The truth for every ranking is accuracy on this item pool, which carries its own sampling
+  noise (about 0.02). Several true gaps are smaller than that.
+- New-model answers were batch-generated and replayed, not served live; at temperature 0 a
+  live run would give the same answers, but its latency and failure behaviour are untested.
+- Only 5 real splits for ranking from scratch: differences of one pair out of 21 are within
+  noise.
+
+### Reproduce
+
+```bash
+python scripts/explanatory_cv.py                       # item bank: held-out log-loss
+python scripts/ranking_experiment.py                   # ranking from scratch (real)
+python scripts/ranking_scaling.py --sizes 8,16,32,64   # simulated scaling (~25 min)
+python scripts/placement_experiment.py                 # new models on the leaderboard
+python scripts/c_concurrency_experiment.py             # distributed, needs PG_DSN/REDIS_URL
+python -m pytest -q tests/test_ranking.py tests/test_c_scheduler.py
+```
+
+The distributed path is exercised by `c_concurrency_experiment.py` and the scheduler tests,
+which start their own workers. `python -m adaptive_eval.c.scheduler` (with a bank from
+`scripts/make_bank2d.py`) is the command-line entry point, but it has not yet been run
+against separately started workers.
+
+The data files (`data/sp6_*.json`) are exported from Postgres with
+`scripts/spatial_matrix.py`; raw results are in `results/c_*.txt`.
+
 ## Known limitations
 
 - **The scheduler is a single process.** It is recoverable (it rebuilds from the Postgres
@@ -379,12 +596,12 @@ VLMs, which need a rented GPU rather than an 8 GB laptop.
 
 ## Roadmap
 
-- **Real provider:** finish `AnthropicProvider` (retry only on 429, 5xx and connection errors),
-  with the image content hash added to the cache key for multimodal items.
-- **Design B:** distributed workers, shared rate limits in Redis, Postgres storage, speculative
-  prefetch of likely next items.
-- **Design C:** adaptive ranking across models, and multidimensional IRT for a hierarchical
-  spatial-reasoning benchmark for vision-language models.
+- **A live Design C run:** serve a new model with `vllm serve` and place it on the leaderboard
+  through the command-line scheduler, instead of replaying batch answers.
+- **More real models:** 12 are fully answered; around 15-30 would let per-item IRT be fitted
+  and checked against the feature-based bank.
+- **A second benchmark** for Design C, so the ranking results do not rest on one item
+  generator.
 
 ## Data and attribution
 
